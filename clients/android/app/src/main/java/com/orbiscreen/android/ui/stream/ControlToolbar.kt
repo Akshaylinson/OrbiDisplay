@@ -1,0 +1,226 @@
+
+package com.orbiscreen.android.ui.stream
+
+import android.content.res.Configuration
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.BarChart
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Keyboard
+import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.Mouse
+import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.TouchApp
+import androidx.compose.material.icons.rounded.VisibilityOff
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.orbiscreen.android.R
+import com.orbiscreen.android.player.StreamStats
+import com.orbiscreen.android.ui.theme.ActiveGreen
+import com.orbiscreen.android.ui.theme.GlassBorderDark
+import com.orbiscreen.android.ui.theme.GlassDark
+
+@Composable
+fun ControlToolbar(
+    hostLabel: String,
+    resolution: String,
+    modifier: Modifier = Modifier,
+    delayMs: Int? = null,
+    isTouchMode: Boolean = false,
+    statsVisible: Boolean = false,
+    onToggleInputMode: () -> Unit = {},
+    onToggleKeyboard: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onToggleStats: () -> Unit = {},
+    onLock: () -> Unit,
+    onHideControls: () -> Unit,
+    onDisconnect: () -> Unit,
+    notice: String? = null,
+    onDismissNotice: () -> Unit = {},
+) {
+    val configuration = LocalConfiguration.current
+    val isPortrait = configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = GlassDark,
+        tonalElevation = 8.dp,
+        modifier = modifier
+            .statusBarsPadding()
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+            .border(1.dp, GlassBorderDark, RoundedCornerShape(24.dp)),
+    ) {
+        if (notice != null) {
+            Text(
+                text = notice,
+                color = Color.White.copy(alpha = 0.85f),
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier
+                    .padding(start = 16.dp, end = 8.dp, top = 10.dp)
+                    .clickable(onClick = onDismissNotice),
+            )
+        }
+        Row(
+            modifier = Modifier
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (!isPortrait) {
+                Box(
+                    modifier = Modifier
+                        .size(8.dp)
+                        .clip(CircleShape)
+                        .background(ActiveGreen),
+                )
+            }
+
+            Column(
+                modifier = Modifier.weight(1f, fill = false).padding(end = 6.dp),
+            ) {
+                if (!isPortrait) {
+                    Text(
+                        text = hostLabel,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                    )
+                }
+                val delayText = StreamStats.formatToolbarDelay(delayMs)
+                val info = listOfNotNull(
+                    resolution.takeIf { it.isNotBlank() && !isPortrait },
+                    delayText,
+                ).joinToString("  ")
+                Text(
+                    text = info,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White.copy(alpha = 0.7f),
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                )
+            }
+
+            if (!isPortrait) {
+                Spacer(Modifier.width(2.dp))
+            }
+
+            ToolbarActionButton(
+                icon = if (isTouchMode) Icons.Rounded.TouchApp else Icons.Rounded.Mouse,
+                contentDescription = if (isTouchMode) stringResource(R.string.mode_touch) else stringResource(R.string.mode_trackpad),
+                onClick = onToggleInputMode,
+            )
+
+            ToolbarActionButton(
+                icon = Icons.Rounded.Keyboard,
+                contentDescription = stringResource(R.string.open_keyboard),
+                onClick = onToggleKeyboard,
+            )
+
+            ToolbarActionButton(
+                icon = Icons.Rounded.Lock,
+                contentDescription = stringResource(R.string.lock_screen),
+                onClick = onLock,
+            )
+
+            ToolbarActionButton(
+                icon = Icons.Rounded.Settings,
+                contentDescription = stringResource(R.string.settings),
+                onClick = onOpenSettings,
+            )
+
+            ToolbarActionButton(
+                icon = Icons.Rounded.BarChart,
+                contentDescription = stringResource(R.string.stats_toggle),
+                onClick = onToggleStats,
+                active = statsVisible,
+            )
+
+            ToolbarActionButton(
+                icon = Icons.Rounded.VisibilityOff,
+                contentDescription = stringResource(R.string.hide_controls),
+                onClick = onHideControls,
+            )
+
+            FilledIconButton(
+                onClick = onDisconnect,
+                shape = CircleShape,
+                modifier = Modifier.size(34.dp),
+                colors = IconButtonDefaults.filledIconButtonColors(
+                    containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.85f),
+                    contentColor = Color.White,
+                ),
+            ) {
+                Icon(
+                    Icons.Rounded.Close,
+                    contentDescription = stringResource(R.string.back),
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ToolbarActionButton(
+    icon: ImageVector,
+    contentDescription: String,
+    onClick: () -> Unit,
+    active: Boolean = false,
+) {
+    FilledIconButton(
+        onClick = onClick,
+        shape = CircleShape,
+        modifier = Modifier.size(34.dp),
+        colors = IconButtonDefaults.filledIconButtonColors(
+            containerColor = if (active) {
+                MaterialTheme.colorScheme.primary
+            } else {
+                Color.White.copy(alpha = 0.14f)
+            },
+            contentColor = if (active) {
+                MaterialTheme.colorScheme.onPrimary
+            } else {
+                Color.White
+            },
+        ),
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = contentDescription,
+            modifier = Modifier.size(18.dp),
+        )
+    }
+}

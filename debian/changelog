@@ -1,0 +1,1660 @@
+orbiscreen (0.41.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.41.0 for Ubuntu noble.
+  * Replace the GTK4 + libadwaita desktop app with a pure C++17 Qt 6
+    Widgets application built with CMake. The new UI uses a native menu bar,
+    toolbar, tabs, status bar, and QSystemTrayIcon, and follows the platform
+    style automatically (Breeze on Plasma; Fusion plus system palette, fonts,
+    and icons elsewhere). It does not link libadwaita or Adwaita-Qt.
+  * Move the GUI out of the Cargo workspace; the Rust workspace no longer
+    depends on GTK. Packaging now uses qt6-base-dev/qt6-qtbase-devel and
+    cmake instead of gtk4/libadwaita.
+  * Generate the connection QR in the daemon over D-Bus (RenderQr) so the Qt
+    client needs only qt6-base and no extra QR package.
+  * Keep the binary name, desktop entry, config path, translations, and
+    start/stop/resolution/doctor behavior compatible.
+  * Bump version to 0.41.0 across all packages; Android versionCode 190.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 15 Nov 2026 12:00:00 +0300
+
+orbiscreen (0.40.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.40.1 for Ubuntu noble.
+  * Fix the pairing deny branch discarding the ExitCode returned by
+    print_pair_outcome, which failed the workspace and release clippy gates
+    under -D unused-must-use.
+  * Upgrade quinn-udp to 0.5.16 for RUSTSEC-2026-0538 (a truncated datagram
+    could spin the receive loop on non-Linux targets). Linux and Android were
+    not exposed, but the advisory database now flags 0.5.15.
+  * Drop cargo-deny ignore entries whose advisories are no longer encountered;
+    cargo-deny treats them as warnings and the release gate denied warnings.
+  * Bump version to 0.40.1 across all packages; Android versionCode 189.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 15 Nov 2026 00:10:00 +0300
+
+orbiscreen (0.40.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.40.0 for Ubuntu noble.
+  * Refactor: shared core modules for session/capture planning, frame
+    conversion, XDG paths and atomic writes, shared memory, port arithmetic,
+    status/doctor reports, and virtual-output identity. Capture opens an
+    explicit CaptureStep plan and shares one PipeWire sink; transport shares
+    one session layer across HTTP Annex-B, MPEG-TS, and WebTransport and owns
+    one protocol module; the daemon shares pipeline pumps and input dispatch.
+  * Removed the separate secondary-display session, which bound the same
+    signaling+2 port as WebTransport. The KWin per-client hub continues to
+    support multiple tablets; secondary input-device naming is removed.
+  * Fixed wlroots relative pointer motion (relative request instead of an
+    absolute cast), portal absolute/relative motion selection, the Android IDR
+    first-request debounce, and the 8790 connector guess. The GUI now reads the
+    real token, surfaces stop/restart failures, and avoids double-writing the
+    config.
+  * Web uses protocol.js with a golden contract test; Android uses Protocol,
+    HostSpec, StreamDefaults, and IdrRequester. Dead host-side codec/layout
+    code, dead parameters, and mirror tests were removed.
+  * Bump version to 0.40.0 across all packages; Android versionCode 188.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 15 Nov 2026 00:00:00 +0300
+
+orbiscreen (0.39.6~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.39.6 for Ubuntu noble.
+  * Fix: AOA proxy streams leaked because each stream maps to a keep-alive TCP
+    connection to the local daemon, and when the client went away the daemon
+    kept the connection open, so the host reader never saw EOF and the entry
+    stayed in the map. The map filled to its 48-entry bound and then evicted
+    one stream per new connection, logging "AOA stream limit reached"
+    indefinitely. Streams now carry a last-activity stamp and are reaped after
+    30 s idle; the eviction warning is rate-limited to the first three.
+  * Unplugging the cable is no longer reported as a fault: ENODEV and ESHUTDOWN
+    log "accessory disconnected" at info instead of a bulk read error, and a
+    draining endpoint logs one writer warning instead of one per packet.
+  * The bare "Io error: Broken pipe" line came from wayland-backend, which
+    falls back to eprintln! without its log feature. The log feature is now
+    enabled, a tracing-log bridge is installed, and wayland_backend is muted by
+    default since Orbiscreen already reports those failures with context.
+  * The Android input dispatcher retried the input WebSocket on every input
+    event; retries are now 1.5 s apart, which stops the AOA stream churn at the
+    source.
+  * Bump version to 0.39.6 across all packages; Android versionCode 187.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 04 Nov 2026 00:00:00 +0300
+
+orbiscreen (0.39.5~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.39.5 for Ubuntu noble.
+  * Fix: configure_infinite_gop set intra-refresh=true on x264enc
+    unconditionally, not only with ORBISCREEN_INFINITE_GOP=1. With
+    intra-refresh on, x264enc emits a real IDR only for the first frame, and
+    GstForceKeyUnit afterwards yields a frame that h264parse flags as a
+    keyframe but that carries no IDR NAL, only P-slices (measured 389 B of
+    [9,7,8,6,1,1,1,1] versus 7065 B of [9,7,8,6,5,5,5,5] for a real IDR).
+    Clients clear their wait-for-keyframe state on that flag, hand the access
+    unit to MediaCodec, get nothing decodable, and request another IDR, so the
+    tablet stayed black while the host logged an IDR every ~300 ms. Hardware
+    encoders masked this because they honour force-key-unit with a real IDR.
+  * intra-refresh is now enabled only with ORBISCREEN_INFINITE_GOP; the
+    default keeps periodic IDRs every 120 frames plus real on-demand IDRs.
+  * Adds a regression test that fails if intra-refresh is enabled again.
+  * Bump version to 0.39.5 across all packages; Android versionCode 186.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Tue, 03 Nov 2026 00:00:00 +0300
+
+orbiscreen (0.39.4~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.39.4 for Ubuntu noble.
+  * Fix: in the default per-client mode the transport video channel had its
+    only sender dropped immediately, so the stats pump exited on the first
+    poll and GetStatus.frames_forwarded stayed 0 regardless of real traffic.
+    The per-session video pump now counts each chunk it forwards while a
+    viewer is attached.
+  * GetStatus.encoder always reported the configured preference ("auto")
+    instead of the encoder in use; it now reports the detected encoder once a
+    session is open.
+  * The software fallback warning no longer reads as an error: it states that
+    no hardware encoder was available and that x264enc is used.
+  * Bump version to 0.39.4 across all packages; Android versionCode 185.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 02 Nov 2026 00:00:00 +0300
+
+orbiscreen (0.39.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.39.3 for Ubuntu noble.
+  * Fix: Plasma 6.8's rewritten kscreen-doctor no longer prints a plain
+    enabled/disabled line for outputs without the Disable capability; it
+    prints "disable unsupported" instead. Every output on the affected system
+    reports that, so the parser saw no enabled outputs, next_available_output_x
+    fell back to 0 and the KWin virtual output was placed at 0,0 on top of the
+    primary screen. The tablet then showed a copy of the primary desktop
+    instead of an independent display, Plasma's notion of the primary screen
+    was disturbed (the panel moved to another screen), and the KWin input
+    devices were never bound because output_uuid and select_tablet_output
+    filter on the same flag.
+  * The parser now treats "disable unsupported" as an enabled output, since an
+    output that cannot be disabled is necessarily on; enabled/disabled parsing
+    is unchanged for older libkscreen versions.
+  * Bump version to 0.39.3 across all packages; Android versionCode 184.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 02 Nov 2026 00:00:00 +0300
+
+orbiscreen (0.39.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.39.2 for Ubuntu noble.
+  * Fix: the wlroots screencopy capture loop issued capture_output and then
+    polled the Wayland socket without flushing the request, so the compositor
+    had nothing to answer until the 100 ms poll timeout expired and only then
+    was the request written. Every frame paid that delay, capping wlroots
+    capture at roughly 10 FPS regardless of the encoder or USB transport. The
+    loop now flushes before prepare_read and poll, matching the ordering of
+    wayland_client::EventQueue::blocking_dispatch; the KWin event pump had the
+    same flush-after-poll ordering and is fixed too.
+  * Reported by @TinusgragLin in #109; the issue is left open pending
+    confirmation.
+  * Bump version to 0.39.2 across all packages; Android versionCode 183.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Tue, 27 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.39.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.39.1 for Ubuntu noble.
+  * Fix: the HTTPS listener on wt_port (pairing, web UI, Android pinned proxy)
+    served the same 14-day WebTransport certificate, so a daemon running for
+    two weeks expired it and a restart changed the fingerprint paired clients
+    pin. The listener now has its own 10-year identity (https-cert.pem /
+    https-key.pem, renewed when under 30 days remain); the 14-day certificate
+    stays on QUIC alone, and /api/info keeps publishing its cert_sha256.
+  * Android: a changed host certificate no longer dead-ends. The fingerprint
+    screen returns with a "host certificate changed" explanation, confirming
+    checks the saved credential against the new pin and keeps the login when
+    the host still accepts it. Existing paired devices re-confirm once.
+  * Dependencies: tokio bumped to 1.53.3 for RUSTSEC-2026-0386.
+  * Reported and fixed by @Bulrok in #107 (PR #108); the issue is left open
+    pending confirmation.
+  * Bump version to 0.39.1 across all packages; Android versionCode 182.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 25 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.39.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.39.0 for Ubuntu noble.
+  * Rewrite the desktop GUI as a native GTK4 + libadwaita application:
+    WebKitGTK, JavaScriptCore, libsoup, GTK3 and appindicator are replaced
+    by GTK 4.10+ and libadwaita 1.4+, the interface carries the same
+    Catppuccin palette as the Android client with automatic dark/light
+    switching, the doctor page now parses the real `orbiscreen doctor
+    --json` report, and the tray icon uses pure-D-Bus StatusNotifierItem
+    via ksni. Bilingual Arabic/English UI with RTL.
+  * Bump version to 0.39.0 across all packages; Android versionCode 181.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 21 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.38.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.38.0 for Ubuntu noble.
+  * Fix: after many hours of streaming the AOA video lane could stall
+    (tablet backgrounded, USB stall), and each stale-frame eviction
+    requested a fresh IDR after only 250 ms — a vicious cycle that
+    saturated the encoder and the USB link. The IDR debounce on eviction
+    is now 1 s, and after 64 consecutive evictions without a successful
+    admit the IDR requests stop entirely until the lane drains again.
+  * Bump version to 0.38.0 across all packages; Android versionCode 180.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Tue, 20 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.37.9~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.37.9 for Ubuntu noble.
+  * Fix: the Android client reported the active display mode's refresh rate
+    instead of the panel capability, so on devices whose active mode is 30 Hz
+    the host paced at 30 fps even though the panel supports 60 Hz or more.
+    The client now reads the maximum rate across supportedModes (like the
+    native resolution), rounds it (59.94 -> 60), and passes the detected rate
+    in every resize path instead of a hardcoded 60. Devices that only support
+    30 still report 30; nothing is forced.
+  * Bump version to 0.37.9 across all packages; Android versionCode 179.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 18 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.37.8~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.37.8 for Ubuntu noble.
+  * Fix (from @Bulrok, PR #105): UsbPlayer now releases decoded frames from a
+    dedicated drain thread instead of only inside the feed path, so no frame
+    is held back by one interval and a full input queue waits up to 40 ms
+    instead of dropping to wait-for-IDR after 8 ms.
+  * Fix (#106): revoked and denied clients no longer count towards the
+    16-client pairing limit; revoke() and deny() remove the entry entirely,
+    and approve() counts only active clients.
+  * Bump version to 0.37.8 across all packages; Android versionCode 178.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 17 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.37.7~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.37.7 for Ubuntu noble.
+  * Suggestion: opt-in infinite GOP so keyframes appear only on demand.
+    Setting ORBISCREEN_INFINITE_GOP=1 makes gop-size -1 and key-int-max /
+    keyframe-period reach their property maximum; the periodic IDR bought
+    nothing on the reliable transports (/au over TCP, AOA) and each one is a
+    big frame spike. The default is unchanged; UDP still gets periodic or
+    intra-refresh recovery.
+  * Suggested and tested by @Bulrok in #99; the issue is left open pending a
+    full before/after benchmark.
+  * Bump version to 0.37.7 across all packages; Android versionCode 177.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 17 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.37.6~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.37.6 for Ubuntu noble.
+  * Fix: the shared-display capture keepalive re-sent a frame up to 100 ms
+    stale when the screen went idle, so the cursor snapped back to an earlier
+    position whenever movement stopped. The snapshot now copies the newest
+    frame on every arrival (reusing the buffer) so the keepalive always
+    re-sends the last real image.
+  * Reported and fixed by @Bulrok in #98 (PR #100); the issue is left open
+    pending confirmation.
+  * Bump version to 0.37.6 across all packages; Android versionCode 176.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 17 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.37.5~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.37.5 for Ubuntu noble.
+  * Fix: the proxy forwarded the client's proxy-local Authorization header
+    unchanged on the /input/ws upgrade and appended the real credential as
+    ?token=, but the host reads the bearer header before the query, so every
+    upgrade was rejected with 401 and all Wi-Fi touch/pen input fell back to
+    one HTTP request per event, which could drop a button release and leave a
+    held button on the host. The upgrade head is now rewritten to replace the
+    Authorization header with the host credential (unit-tested), and the
+    WebSocket listener logs its failures.
+  * Reported and fixed by @Bulrok in #97 (PR #101); the issue is left open
+    pending confirmation.
+  * Bump version to 0.37.5 across all packages; Android versionCode 175.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 16 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.37.4~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.37.4 for Ubuntu noble.
+  * Fix: PinnedHostProxy left Nagle on for its loopback sockets, so the
+    relay's small writes waited for delayed ACKs and a 60 fps stream reached
+    the player in ~40 ms clumps. The loopback serve socket and the upstream
+    /input/ws socket now set tcpNoDelay, and the HTTPS listener sets
+    TCP_NODELAY through axum_server's NoDelayAcceptor.
+  * Reported and fixed by @Bulrok in #96 (PR #102); the issue is left open
+    pending confirmation.
+  * Bump version to 0.37.4 across all packages; Android versionCode 174.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 16 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.37.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.37.3 for Ubuntu noble.
+  * Fix: on hosts without per-client display sessions (GNOME/portal) the
+    client never gets a UDP key, so Wi-Fi video fell back to ExoPlayer's
+    buffered MPEG-TS. /au is now allowed through the pinned proxy and, when
+    no UDP target is available, PlayerHolder tries UsbPlayer.startHttp (the
+    /au to MediaCodec path the USB fallback uses) before ExoPlayer, falling
+    back to MPEG-TS only if it fails.
+  * Reported and fixed by @Bulrok in #95 (PR #104); the issue is left open
+    pending confirmation.
+  * Bump version to 0.37.3 across all packages; Android versionCode 173.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 16 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.37.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.37.2 for Ubuntu noble.
+  * Fix: closing a Conscrypt TLS socket flushes its outgoing queue (a
+    blocking network write) and evicting an OkHttp pool closes such sockets;
+    PinnedHostProxy.close(), PlayerHolder.shutdownHttpClient() and the
+    healthHttp eviction in StreamViewModel.onCleared() can all run on the
+    main thread, where StrictMode kills the process with
+    NetworkOnMainThreadException. The teardown now runs on a short-lived
+    daemon thread when called from the main looper.
+  * Reported and fixed by @Bulrok in #94 (PR #103, merged); the issue is
+    left open pending confirmation.
+  * Bump version to 0.37.2 across all packages; Android versionCode 172.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 15 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.37.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.37.1 for Ubuntu noble.
+  * Fix: on a GNOME host the daemon has no per-client displays, so
+    POST /api/session answers 501. The Android client treated the missing
+    session as fatal on LAN and the generic login handler reported it as a
+    pairing/TLS failure, so every Wi-Fi connection failed with "Pairing
+    failed" while pairing had succeeded. The LAN path now tolerates the
+    missing session like the USB path and falls back to the shared display,
+    and the login catch blocks log the underlying exception.
+  * Reported and diagnosed by @Bulrok in #93; the issue is left open.
+  * Bump version to 0.37.1 across all packages; Android versionCode 171.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 15 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.37.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.37.0 for Ubuntu noble.
+  * Fix: v0.36.9 hid the cursor with POINTER_HIDDEN and composited it from the
+    client's pointer events, which removed the external-mouse cursor entirely.
+    The compositor cursor is embedded again (so an external mouse behaves like
+    a normal extra monitor) and, instead of moving the pointer on every event,
+    a pointer to touch/pen switch parks the host pointer just outside the
+    virtual output once per switch so the cursor is not drawn during touch or
+    pen. The composited-cursor overlay is removed again.
+  * Bump version to 0.37.0 across all packages; Android versionCode 170.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 12 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.36.9~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.36.9 for Ubuntu noble.
+  * Fix: v0.36.7 parked the host pointer on every touch and pen event, which
+    regressed the stream. The KWin virtual output now captures with the cursor
+    hidden (POINTER_HIDDEN) and the daemon composites the pointer from the
+    client's pointer events, hiding it on touch or pen, so the cursor no
+    longer lingers on the virtual display and no per-event pointer motion is
+    injected.
+  * Restore the composited pointer sprite and its clipping tests.
+  * Bump version to 0.36.9 across all packages; Android versionCode 168.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 12 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.36.8~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.36.8 for Ubuntu noble.
+  * Revert: v0.36.7 parked the absolute pointer on every touch and pen event
+    so the cursor would not linger on the virtual display. That churn
+    regressed the live setup (stuttering with a low frame rate, AOA
+    video-lane congestion with repeated re-attaches, and a displaced,
+    interfering pointer), so it is reverted. The compositor cursor stays
+    embedded and the external mouse behaves like a normal extra monitor again
+    while touch and pen drive the confined virtual pointer.
+  * Bump version to 0.36.8 across all packages; Android versionCode 167.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 12 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.36.7~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.36.7 for Ubuntu noble.
+  * Fix: with the compositor cursor embedded (so an external mouse behaves
+    like a normal extra monitor) the pointer stayed drawn on the virtual
+    display while touch or pen was used. A touch or pen event now parks the
+    host pointer just outside the virtual output so KWin stops drawing the
+    cursor there, and the external mouse brings it back when it moves across
+    the virtual display.
+  * Bump version to 0.36.7 across all packages; Android versionCode 166.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 12 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.36.6~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.36.6 for Ubuntu noble.
+  * Fix: v0.36.4 hid the compositor cursor and composited a client-driven
+    pointer, which removed the cursor ghost but also made an external mouse
+    invisible on the virtual display. The compositor cursor is embedded again
+    (POINTER_EMBEDDED) so the real pointer shows and moves in and out of the
+    virtual output like any other monitor, while touch and pen still drive the
+    confined virtual pointer from the app. The composited-cursor overlay is
+    removed.
+  * Bump version to 0.36.6 across all packages; Android versionCode 165.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 12 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.36.5~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.36.5 for Ubuntu noble.
+  * Fix: the absolute pointer device captured the workspace geometry when the
+    session opened, so rearranging the displays left the mapping stale and the
+    injected pointer landed outside the virtual output (appearing on the
+    primary while the composited cursor stayed on the virtual one). The input
+    pump now re-reads the layout every couple of seconds and rebuilds the
+    pointer device when it changes.
+  * Sharpen the composited pointer sprite.
+  * Bump version to 0.36.5 across all packages; Android versionCode 164.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 11 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.36.4~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.36.4 for Ubuntu noble.
+  * Fix: the KWin virtual output was captured with the pointer embedded, so
+    KWin drew the cursor into the stream; when the pointer moved to another
+    output KWin did not repaint the virtual output and the 100 ms keepalive
+    re-sent the last frame, leaving a phantom cursor on the second display.
+    The virtual output now captures with the pointer hidden and the daemon
+    composites the cursor from the client's pointer input, so it follows the
+    app and disappears on touch, pen, or when the session ends.
+  * Bump version to 0.36.4 across all packages; Android versionCode 163.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 11 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.36.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.36.3 for Ubuntu noble.
+  * Fix: a pinned (or SetDefaults) host display was forced over every
+    client's requested resolution, so each client had to resize after
+    connecting; with two tablets that resize/reconnect cycle looped and drove
+    both streams past 1200 ms. The client's explicit request now wins and the
+    pinned size is used only when a client asks for nothing.
+  * The Android client no longer resizes after connecting.
+  * The AOA proxy stream cap is raised from 16 to 48: the client keeps about
+    15 keep-alive streams open, so a cap of 16 evicted a live stream roughly
+    once a second and added latency.
+  * Bump version to 0.36.3 across all packages; Android versionCode 162.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 11 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.36.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.36.2 for Ubuntu noble.
+  * Fix: a pinned host display overrides a client's requested resolution by
+    design, so a low-end tablet (Allwinner L10, panel 1280x800 @ 59 Hz, H.264
+    decoder capped at 2048x2048 and 489,600 macroblocks/s) was pinned to
+    2560x1600 and ran about twice over its macroblock budget, giving blocky
+    output near 30 fps with 300-400 ms of latency. The Android client now
+    clamps the selected resolution to the panel and applies it with a resize
+    after connecting.
+  * Bump version to 0.36.2 across all packages; Android versionCode 161.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 11 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.36.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.36.1 for Ubuntu noble.
+  * Fix: resolution changes were rejected with "unknown session" once the
+    first resize had aliased the session id, so the client's request never
+    reached the display and the toolbar size never updated. The hub now
+    resolves the alias chain before resizing.
+  * Fix: the virtual-display bitrate was taken verbatim from the client's
+    RAM-tier estimate; it is now floored at the resolution's suggested rate so
+    a lower-memory device does not cap a 2560x1600 stream near 10 Mbps.
+  * Fix: evicted AOA streams were shut down without a CLOSE frame, so the
+    Android proxy reconnected and reopened streams in a loop. The evicted
+    stream id is now closed explicitly.
+  * Fix: saved custom resolutions (for example 1280x800) are respected again.
+  * Remove the encoder badge from the Android control toolbar.
+  * Bump version to 0.36.1 across all packages; Android versionCode 160.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 10 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.36.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.36.0 for Ubuntu noble.
+  * Fix: show the mouse pointer on the streamed second display under GNOME
+    Wayland. The ScreenCast portal session requested CursorMode::Hidden, so
+    Mutter never composited the pointer; it now requests
+    CursorMode::Embedded for both the virtual-source and monitor-fallback
+    paths. The wlroots screencopy backend also passes overlay_cursor=1 to
+    zwlr_screencopy_manager_v1.capture_output.
+  * Reported and diagnosed by @sarawer in #91; the issue is left open.
+  * Bump version to 0.36.0 across all packages; Android versionCode 159.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 09 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.35.9~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.35.9 for Ubuntu noble.
+  * Fix: confine the trackpad pointer to the virtual display. The virtual
+    mouse is now an absolute pointer whose axis range spans the workspace and
+    whose injected position is offset by the virtual output origin, so the
+    cursor can no longer roam across every monitor; the position is derived
+    from kscreen-doctor at session open.
+  * Bind all KWin input devices (mouse, touch, pen) to the virtual output, and
+    stop leaking kscreen-doctor output to the daemon stdout.
+  * Emit the query-string token warning only when a query token is accepted,
+    and stop the encoder before draining its pump to avoid transition drops.
+  * Put the COPR %changelog in descending order with correct weekdays.
+  * Bump version to 0.35.9 across all packages; Android versionCode 158.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 09 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.35.8~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.35.8 for Ubuntu noble.
+  * Fix: the KWin virtual-display damage pump committed on a fixed 16 ms
+    interval (62.5 Hz) instead of the output refresh rate, which beat against
+    the 60 Hz vblank and held the stream near 51 fps. The pump now paces at
+    1e9/refresh_hz nanoseconds and the refresh rate is threaded from the
+    session into the virtual-display spec; the capture frame channel was
+    widened from 2 to 8 to stop "consumer channel full" drops on transitions.
+  * Bump version to 0.35.8 across all packages; Android versionCode 157.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 09 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.35.7~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.35.7 for Ubuntu noble.
+  * Fix: stopping the host left the client on the stream screen with the
+    frame age climbing forever, because the AOA accessory stays claimed and
+    the frame-age calculation had no ceiling. The client now treats three
+    seconds without video as a disconnect and returns to discovery, caps the
+    reported frame age, and applies the same handling to the HTTP /au path.
+  * Bump version to 0.35.7 across all packages; Android versionCode 156.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 09 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.35.6~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.35.6 for Ubuntu noble.
+  * Fix: the USB client buffered too many frames (32-chunk payload watermark
+    and a stale queue left in place when waiting for a keyframe) and did not
+    reconfigure the decoder after a resolution-change re-attach. The
+    watermark is now 6, entering the wait-for-keyframe state clears the
+    queue, and re-attach sends a fresh open-ack so the client reconfigures
+    at the new size. Measured on the test tablet: 23 fps / 663 ms before,
+    51 fps / 52 ms after.
+  * Bump version to 0.35.6 across all packages; Android versionCode 155.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 09 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.35.5~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.35.5 for Ubuntu noble.
+  * Fix: the Android client now probes the hardware AVC decoder at the
+    session size and, when the decoder rejects it, asks the host for a
+    smaller hardware-decodable size, instead of silently falling back to the
+    software decoder (which was slower and capped at 1920x1088). Failed
+    codec instances are released before the next attempt.
+  * Bump version to 0.35.5 across all packages; Android versionCode 154.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 09 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.35.4~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.35.4 for Ubuntu noble.
+  * Fix: uinput device names are now unique per client session (the KWin
+    connector suffix is part of the label) and closing a session awaits the
+    input pump, so a reconnecting client can no longer bind the dying input
+    devices of its previous session. See
+    https://github.com/shadow-x78/orbiscreen/issues/90
+  * Bump version to 0.35.4 across all packages; Android versionCode 153.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 08 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.35.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.35.3 for Ubuntu noble.
+  * Fix: the Android client's native USB video path kept retrying a failing
+    MediaCodec configuration forever (black screen plus an endless IDR
+    request loop). The decoder now falls back through hardware with low
+    latency hints, hardware without them, and the software AVC decoder, and
+    the stats overlay shows the decoder state.
+  * Bump version to 0.35.3 across all packages; Android versionCode 152.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 08 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.35.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.35.2 for Ubuntu noble.
+  * Fix: the Android control toolbar sat under the status bar in portrait and
+    its action buttons could overflow off-screen; changing dimensions over
+    Wi-Fi cut the session (a host-closed UDP session now re-opens the display
+    session and re-issues its UDP key); the resolution presets were two rows
+    of fixed-width chips instead of one full-width row; and the mislabeled
+    100% scale mode (a crop on ExoPlayer, fit on UDP) is removed.
+  * Bump version to 0.35.2 across all packages; Android versionCode 151.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 07 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.35.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.35.1 for Ubuntu noble.
+  * Fix: open the initial per-client session at the client's panel refresh
+    (sent as refresh_hz) instead of the host monitor's, bound USB AOA
+    recovery to one IDR after a lane eviction instead of silent stream
+    holes, warn on AOA lane drops, and print the stream URL with #token=
+    so the credential stays out of server logs and Referer headers.
+  * Bump version to 0.35.1 across all packages; Android versionCode 150.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 07 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.35.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.35.0 for Ubuntu noble.
+  * feat: unify the web client and GUI on the Android app's design system
+  * Bump version to 0.35.0 across all packages; Android versionCode 149.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.34.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.34.2 for Ubuntu noble.
+  * Fix: accept all four 32-bit wl_shm formats in screencopy, so Sway's native
+    virtual output (offered as Xbgr8888) captures instead of dying; and negotiate
+    the portal monitor fallback on a fresh session instead of the handle the wlr
+    portal invalidated. See
+    https://github.com/shadow-x78/orbiscreen/issues/89
+  * Bump version to 0.34.2 across all packages; Android versionCode 148.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.34.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.34.1 for Ubuntu noble.
+  * Fix: raise the GUI window minimum width from 460 to 520, above the measured
+    requirement of the unshrinkable header under WebKitGTK metrics. See
+    https://github.com/shadow-x78/orbiscreen/issues/86
+  * Bump version to 0.34.1 across all packages; Android versionCode 147.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.34.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.34.0 for Ubuntu noble.
+  * Fix: a revoked pairing still showed under "Paired device(s)" in
+    `orbiscreen pair list`; the D-Bus ListPairings reply now carries Approved
+    clients only. Closes the pairing review surface follow-up to
+    https://github.com/shadow-x78/orbiscreen/issues/88
+  * Bump version to 0.34.0 across all packages; Android versionCode 146.
+
+  * Release 0.34.0 for Ubuntu noble.
+  * fix: hide revoked devices from the pairing list
+  * Bump version to 0.34.0 across all packages; Android versionCode 146.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.33.10~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.33.10 for Ubuntu noble.
+  * fix: hide revoked devices from the pairing list
+  * Bump version to 0.33.10 across all packages; Android versionCode 146.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.33.9~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.33.9 for Ubuntu noble.
+  * chore: bump version to 0.33.6
+  * Bump version to 0.33.9 across all packages; Android versionCode 144.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.33.8~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.33.8 for Ubuntu noble.
+  * docs: write the 30 troubleshooting sections that were listed but missing
+  * Bump version to 0.33.8 across all packages; Android versionCode 144.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.33.7~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.33.7 for Ubuntu noble.
+  * docs: rebuild the troubleshooting contents so every link reaches a section
+  * Bump version to 0.33.7 across all packages; Android versionCode 143.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.33.6~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.33.6 for Ubuntu noble.
+  * chore: comment policy guard, branding and Android stream UI
+  * Bump version to 0.33.6 across all packages; Android versionCode 142.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.33.5~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.33.5 for Ubuntu noble.
+  * fix: accept the query-string token again; web input retries without a session
+  * Bump version to 0.33.5 across all packages; Android versionCode 141.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.33.4~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.33.4 for Ubuntu noble.
+  * fix: AOA video starvation, encoder VBV sizing, bounded USB writes
+  * Bump version to 0.33.4 across all packages; Android versionCode 140.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.33.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.33.3 for Ubuntu noble.
+  * fix: the AOA stream bound must evict, not refuse; and loopback peers are not TLS-redirected.
+  * Bump version to 0.33.3 across all packages; Android versionCode 139.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.33.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.33.2 for Ubuntu noble.
+  * fix: restore the RPM_GPG_KEY fallback for the Launchpad upload.
+  * Bump version to 0.33.2 across all packages; Android versionCode 138.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.33.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.33.1 for Ubuntu noble.
+  * fix: ship the web client and system files in the release tarball.
+  * Bump version to 0.33.1 across all packages; Android versionCode 137.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.33.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.33.0 for Ubuntu noble.
+  * chore: promote 0.32.10 to the 0.33.0 minor release.
+  * Bump version to 0.33.0 across all packages; Android versionCode 136.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.32.10~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.32.10 for Ubuntu noble.
+  * chore: add the version synchronization script used by the release train.
+  * Bump version to 0.32.10 across all packages; Android versionCode 135.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.32.9~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.32.9 for Ubuntu noble.
+  * chore: remove the inline comments added during this series.
+  * Bump version to 0.32.9 across all packages; Android versionCode 134.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.32.8~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.32.8 for Ubuntu noble.
+  * unsafe documentation, TLS-only credential paths, D-Bus authorization.
+  * Bump version to 0.32.8 across all packages; Android versionCode 133.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.32.7~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.32.7 for Ubuntu noble.
+  * cross-session input injection, Tauri UI, packaging gaps.
+  * Bump version to 0.32.7 across all packages; Android versionCode 132.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.32.6~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.32.6 for Ubuntu noble.
+  * Android resource leaks, data races and request storms.
+  * Bump version to 0.32.6 across all packages; Android versionCode 131.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.32.5~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.32.5 for Ubuntu noble.
+  * AOA stream cap, BYE handling, dead discovery chain.
+  * Bump version to 0.32.5 across all packages; Android versionCode 130.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.32.4~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.32.4 for Ubuntu noble.
+  * drop unused assets and scripts, add missing unit tests.
+  * Bump version to 0.32.4 across all packages; Android versionCode 129.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.32.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.32.3 for Ubuntu noble.
+  * standardize banner comments on non-code files.
+  * Bump version to 0.32.3 across all packages; Android versionCode 128.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.32.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.32.2 for Ubuntu noble.
+  * cross-session input injection, dead Tauri UI, packaging gaps.
+  * Bump version to 0.32.2 across all packages; Android versionCode 127.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 03 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.32.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.32.1 for Ubuntu noble.
+  * Fix touch injection: remove redundant AbsEvent::X/Y writes emitted after finish_slot() and duplicate BTN_TOUCH PRESSED/RELEASED events that caused phantom touches.
+  * Re-indent the run_hub idle reap branch so close_session and idle_at.remove read as nested under the `if reap` guard. Indentation only, no behavior change.
+  * Bump version to 0.32.1 across all packages; Android versionCode 126.
+
+-- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 02 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.32.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.32.0 for Ubuntu noble.
+  * Fix resize switchover: remove ~400 ms hub stall and `no display session` error on resolution change.
+  * Encoder now honors the requested fps on resize instead of re-encoding at the default refresh rate.
+  * AOA re-attach resolves resized sessions automatically without a 100 ms blind delay.
+  * Bump version to 0.32.0 across all packages; Android versionCode 125.
+
+  -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 01 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.31.9~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.31.9 for Ubuntu noble.
+  * Fix resize switchover: remove ~400 ms hub stall and `no display session` error on resolution change.
+  * Encoder now honors the requested fps on resize instead of re-encoding at the default refresh rate.
+  * AOA re-attach resolves resized sessions automatically without a 100 ms blind delay.
+  * Bump version to 0.31.9 across all packages; Android versionCode 124.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 01 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.31.8~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.31.8 for Ubuntu noble.
+  * Android: restore stable ExoPlayer buffers and original toolbar layout.
+  * Web client: repair template literals truncated by the comment-removal pass.
+  * Bump version to 0.31.8 across all packages; Android versionCode 123.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 01 Oct 2026 00:00:00 +0300
+
+orbiscreen (0.31.7~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.31.7 for Ubuntu noble.
+  * Restore resize stream stall fix and damage pump deadline pacing.
+  * Android: saved resolution preset priority, toolbar width, low-latency buffers.
+  * Bump version to 0.31.7 across all packages; Android versionCode 122.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Tue, 30 Sep 2026 06:30:00 +0300
+
+orbiscreen (0.31.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.31.3 for Ubuntu noble.
+  * Bump version to 0.31.3 across all packages; Android versionCode 118.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 27 Sep 2026 03:00:00 +0300
+
+orbiscreen (0.31.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.31.2 for Ubuntu noble.
+  * Bump version to 0.31.2 across all packages; Android versionCode 117.
+  * Performance: increased HTTP/UDP buffer sizes, relaxed frame dropping thresholds, frame rate limiting in capture pump.
+  * Sync release metadata in docs, specs, and badges.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 21 Sep 2026 15:00:00 +0300
+
+orbiscreen (0.31.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.31.0 for Ubuntu noble.
+  * Add dedicated WebSocket input channel on /input/ws eliminating mouse lag, stutter, and queue backpressure.
+  * Bind virtual uinput devices to KWin virtual output in kwinrc confining touch and touchpad to virtual display.
+  * Add in-session resolution control panel with native/preset chips and custom dimensions in Android client.
+  * Eliminate unwrap panics across production daemon, transport, and FEC code paths.
+  * Purge internal source comments while preserving top license headers and standardized config box comments.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 20 Sep 2026 12:00:00 +0300
+
+orbiscreen (0.30.9~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.30.9 for Ubuntu noble.
+  * Prevent GStreamer segmentation fault and CRITICAL disposal warnings on USB disconnect.
+  * Wrap GStreamer video pipeline in RAII PipelineGuard ensuring synchronous State::Null teardown.
+  * Perform display session attach before constructing video pipeline to avoid orphan pipelines on attach failure.
+  * Implement smart multi-client session routing correlating client key and unattached sessions.
+  * Pass X-Orbiscreen-Session and client key in ExoPlayer headers while preserving session across transient reconnects.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 19 Sep 2026 22:50:00 +0300
+
+orbiscreen (0.30.8~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.30.8 for Ubuntu noble.
+  * Overhaul direct touch and mouse dragging with BTN_LEFT synchronization on uinput touchscreen device.
+  * Emit UDP BYE datagrams on daemon Ctrl+C shutdown and add active health watchdog in Android client.
+  * Resolve secondary tablet display freeze by decoupling per-client resolution and routing IDR requests.
+  * Protect AOA USB bridges against poisoned mutex panics and eliminate WebTransport frame slice panics.
+  * Purge internal source comments while preserving credit headers and standardized boxed config comments.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 19 Sep 2026 20:10:00 +0300
+
+orbiscreen (0.30.7~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.30.7 for Ubuntu noble.
+  * Eliminate display freezing and deadlocks upon mouse cursor entry by reverting multi-threaded nearest-neighbor videoscale.
+  * Restore safe crisp bilinear videoscale capture scaling.
+  * Implement smart resolution negotiation: auto-detect client physical resolution (2560x1536) by default while honoring explicit user overrides.
+  * Add tablet-friendly resolution presets (2560x1536, 1920x1152, 1280x768) in GUI dashboard.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 19 Sep 2026 14:00:00 +0300
+
+orbiscreen (0.30.6~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.30.6 for Ubuntu noble.
+  * Eliminate 125% scaling latency and frame backlog with 4-thread nearest-neighbor videoscale.
+  * Fix resolution configuration ignored on client connection by prioritizing host geometry.
+  * Dynamically apply resolution changes to active display sessions via D-Bus.
+  * Restore Direct Touch mode by removing relative mouse movements from uinput touch injector.
+  * Clean up and deduplicate Android input networking configuration.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 19 Sep 2026 12:25:00 +0300
+
+orbiscreen (0.30.5~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.30.5 for Ubuntu noble.
+  * Eliminate permanent display freeze by never discarding buffers to keyframe in ExoPlayer.
+  * Fix non-monotonic backward jumps in PTS timestamps during frame bursts.
+  * Drastically cut mouse input latency by tuning ExoPlayer buffer durations to 30ms.
+  * Lock live playback speed to 1.0f to eliminate speed jitter.
+  * Relax frame dropping threshold to 150ms to prevent micro frame drops at 90Hz.
+  * Restore compositor damage pump interval to 16ms.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 18 Sep 2026 18:35:00 +0300
+
+orbiscreen (0.30.4~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.30.4 for Ubuntu noble.
+  * Fix frozen display and stuck mouse caused by appsink back-pressure regression in v0.30.3.
+  * Remove dead code in ExoPlayer shouldDropOutputBuffer that was left behind from v0.30.3.
+  * Revert KWin FRAME_CHANNEL_CAPACITY from 4 to 2 for stable low-latency frame delivery.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 18 Sep 2026 16:27:00 +0300
+
+orbiscreen (0.30.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.30.3 for Ubuntu noble.
+  * Eliminate micro frame drops by disabling aggressive 30ms ExoPlayer frame drop.
+  * Clamp PTS to prevent forward timestamp drift during frame bursts.
+  * Prevent silent GStreamer appsink drops in the H.264 encoder pipeline.
+  * Optimize KWin virtual display damage pump interval to 11ms for 90Hz.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 18 Sep 2026 13:30:00 +0300
+
+orbiscreen (0.30.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.30.2 for Ubuntu noble.
+  * Fix GUI unresponsiveness and JavaScript parse error (Issue #81).
+  * Add dynamic version retrieval in GUI via Tauri command and D-Bus status.
+  * Prevent automatic reconnection loop after user-initiated disconnect.
+  * Ensure graceful daemon shutdown and encoder pipeline cleanup on Ctrl+C.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 18 Sep 2026 02:35:00 +0300
+
+orbiscreen (0.30.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.30.1 for Ubuntu noble.
+  * Fix NVENC VBV buffer cap and dynamic bitrate scaling to eliminate pixelation and macroblocking.
+  * Unblock UDP video keyframes to prevent decoder freezes and IDR recovery storms.
+  * Fix KWin pointer output binding to restore fluid desktop mouse motion.
+  * Synchronize touch input with mouse cursor in X11 input injector.
+  * Optimize Android input dispatcher with motion event coalescing.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 18 Sep 2026 00:25:00 +0300
+
+orbiscreen (0.30.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.30.0 for Ubuntu noble.
+  * Comprehensive full project audit and LAN security hardening.
+  * Loopback-only bootstrap tokens and first-time pairing credential store.
+  * Strict Android input serialization and trackpad click delta flush.
+  * Zero-inline-comment policy enforcement across all crates and clients.
+  * Raised MSRV to 1.92 and updated packaging for Ubuntu Noble.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 17 Sep 2026 20:20:00 +0300
+
+orbiscreen (0.29.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.29.1 for Ubuntu noble.
+  * Fix dual screen AOA USB supervisor port routing to target daemon port.
+  * Guard Android input dispatcher against unauthenticated 401 request storms.
+  * Fix KWin pointer binding to allow fluid desktop mouse cursor motion.
+  * Add automatic session reconnection and extend post-viewer idle timeout.
+  * Bump version across workspace and packaging configurations.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 17 Sep 2026 05:05:00 +0300
+
+orbiscreen (0.29.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.29.0 for Ubuntu noble.
+  * WebTransport Annex-B web client with WebCodecs hardware decoding.
+  * One-frame VBV rate control for ultra-low latency streaming.
+  * Reliable IDR stream with Reed-Solomon FEC for P-frame datagrams.
+  * Android client AU reordering and packet loss recovery.
+  * Bump version across workspace and packaging configurations.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 16 Sep 2026 23:25:00 +0300
+
+orbiscreen (0.28.9~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.28.9 for Ubuntu noble.
+  * Support per-client KWin virtual outputs and isolated touch scoping for simultaneous multi-tablet streaming.
+  * Introspect KWin input devices dynamically past event63 for reliable touch and pointer device binding.
+  * Add automatic fallback session creation in client_display for legacy client backwards compatibility.
+  * Bump version across workspace and packaging configurations.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 16 Sep 2026 16:36:00 +0300
+
+orbiscreen (0.28.8~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.28.8 for Ubuntu noble.
+  * Terminate lingering daemon processes when D-Bus stop request times out or session bus name has no owner.
+  * Optimize Android video rendering pipeline for legacy and low-end tablets.
+  * Document software decoder fallback for low-end SoC hardware decoders.
+  * Bump version across workspace and packaging configurations.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 16 Sep 2026 14:18:00 +0300
+
+orbiscreen (0.28.7~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.28.7 for Ubuntu noble.
+  * Eliminate frozen video stream on low-end and legacy Android tablets.
+  * Relax ExoPlayer shouldDropOutputBuffer threshold from -50ms to -250ms to absorb decode jitter.
+  * Configure shouldDropBuffersToKeyframe to request IDR on lag exceeding 300ms without dropping frames.
+  * Parse display geometry from kscreen-doctor to automatically position KWin virtual displays adjacent to active monitors.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 16 Sep 2026 09:30:00 +0300
+
+orbiscreen (0.28.6~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.28.6 for Ubuntu noble.
+  * Enable live virtual display resolution and framerate switching from desktop GUI Display settings.
+  * Wire D-Bus SetResolution method to kscreen-doctor dynamic modes and persistent orbiscreen.toml config.
+  * Synchronize UI active resolution and framerate chips with daemon status.
+  * Add Arch Linux and Manjaro PKGBUILD build instructions to documentation.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 16 Sep 2026 08:05:00 +0300
+
+orbiscreen (0.28.5~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.28.5 for Ubuntu noble.
+  * Send FRAME_FLAG_RESET on host shutdown to trigger immediate AOA accessory teardown in Android client.
+  * Check host health endpoint before reporting USB ready to eliminate stale connection state after daemon exit.
+  * Fix fit mode selection by mapping scale modes to engine integer values and applying them in real-time.
+  * Clarify pointer speed UI controls for trackpad mode.
+  * Resolve secondary display touch injection drop in uinput injector by tracking MT Type B slot IDs.
+  * Expand OkHttp client concurrent request limits to prevent touch event queue stalls.
+  * Configure lightweight default capture profile (720p@60Hz, 3500 kbps) for secondary display to eliminate bus congestion.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 16 Sep 2026 07:30:00 +0300
+
+orbiscreen (0.28.4~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.28.4 for Ubuntu noble.
+  * Fix Android tablet black screen over USB (AOA) by expanding MPEG-TS buffer capacity to 2048 chunks.
+  * Eliminate video pipeline packet dropping in appsrc and appsink.
+  * Optimize USB bulk transfer framing to fit within single USB transfer packet limits.
+  * Prevent initial black frame injection and cache keepalive only after first real frame capture.
+  * Fix daemon stop deadlock by removing watch channel race condition.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 16 Sep 2026 03:00:00 +0300
+
+orbiscreen (0.28.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.28.3 for Ubuntu noble.
+  * Fix tablet black screen by dynamically scanning and binding asynchronous Wayland outputs in damage pump.
+  * Pre-seed capture pipeline with initial black frame in cap_pump to prevent encoder and stream starvation.
+  * Add automatic runtime fallback from failing hardware encoders to software x264.
+  * Add GStreamer pipeline bus sync handler for real-time encoder warning and error reporting.
+  * Expand AOA video sync_channel buffer capacity to 64 chunks to prevent frame drops on keyframe bursts.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 16 Sep 2026 01:15:00 +0300
+
+orbiscreen (0.28.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.28.2 for Ubuntu noble.
+  * Fix broken pipe error on host session lock via client shutdown notification.
+  * Prevent GStreamer AppSink callback stalls by switching to non-blocking try_send.
+  * Increase broadcast video channel capacity from 8 to 64 slots to prevent IDR cascades.
+  * Eliminate UDP hub probe tick mutex contention during network I/O.
+  * Add 2-second grace period to UDP client TTL prune to prevent presence oscillation.
+  * Request IDR keyframe on UDP hub broadcast lag recovery.
+  * Optimize keepalive frame snapshot memory footprint with Arc slice buffer.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Tue, 15 Sep 2026 21:45:00 +0300
+
+orbiscreen (0.28.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.28.1 for Ubuntu noble.
+  * Drop stale frames and eliminate stream latency accumulation (PR #78 by @Yashb404).
+  * Configure HTTP MPEG-TS pipeline with is-live=true and appsink drop=true max-buffers=1.
+  * Clamp PTS timeline desync across frame gaps (>250ms) to nominal frame time.
+  * Reduce AOA USB accessory sync_channel capacity from 64 to 8 chunks.
+  * Multi-thread software color conversion with n-threads=4 on videoconvert.
+  * Constrain appsrc max-bytes and appsink max-buffers across capture pipelines.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 14 Sep 2026 19:40:00 +0300
+
+orbiscreen (0.28.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.28.0 for Ubuntu noble.
+  * Eliminate USB video frame drops on Screen 1: expand socket buffer to 256KB and tune ExoPlayer pacing.
+  * Fix secondary display black screen: implement dynamic wl_output binding and configure retries in damage pump.
+  * Restore standard relative mouse motion across all displays without boundary confinement.
+  * Align Android touch and stylus coordinates 1:1 to host display pixels.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 12 Sep 2026 18:15:00 +0300
+
+orbiscreen (0.27.9~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.27.9 for Ubuntu noble.
+  * Eliminate USB video frame drops on Screen 1: expand socket buffer to 256KB and tune ExoPlayer pacing (Closes: #77).
+  * Fix secondary display black screen: implement dynamic wl_output binding and configure retries in damage pump (Closes: #77).
+  * Restore standard relative mouse motion across all displays without boundary confinement (Closes: #77).
+  * Align Android touch and stylus coordinates 1:1 to host display pixels (Closes: #77).
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 12 Sep 2026 06:40:00 +0300
+
+orbiscreen (0.27.8~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.27.8 for Ubuntu noble.
+  * Fix secondary display damage pump matching: prevent Virtual-ORBISCREEN-2 from attaching to primary display (Closes: #77).
+  * Eliminate USB AOA frame drops, video stutter, and keyframe stalls by increasing sync channel capacity and bounding pts calculation (Closes: #77).
+  * Fix mouse delta speed and cursor bounds in Android PlayerSurface (Closes: #77).
+  * Completely remove USB audio pipeline and preferences across daemon, transport, and Android app (Closes: #77).
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 12 Sep 2026 00:35:00 +0300
+
+orbiscreen (0.27.7~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.27.7 for Ubuntu noble.
+  * Fix secondary display black screen: pace independent 60fps damage ticks to Virtual-ORBISCREEN-2 and push initial keepalive IDR frame (Closes: #77).
+  * Auto-position secondary display to the right of primary monitor via kscreen-doctor (Closes: #77).
+  * Eliminate mouse rubberbanding and cursor jitter: route pointer motion strictly as relative events to mouse_keyboard and isolate stylus pen tools (Closes: #77).
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 11 Sep 2026 21:15:00 +0300
+
+orbiscreen (0.27.6~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.27.6 for Ubuntu noble.
+  * Support concurrent secondary tablet virtual display on KDE Plasma with dynamic port allocation and uinput input isolation (Closes: #77).
+  * Expand AOA candidate detection to Allwinner devices and sysfs MTP/ADB interface probing (Closes: #77).
+  * Eliminate mouse cursor stutter by isolating relative pointer events from tablet stylus coordinate injection (Closes: #77).
+  * Optimize Android ExoPlayer buffer pacing to 45-120ms with dynamic live speed adjustment to prevent frame drops and audio starvation.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 11 Sep 2026 19:48:00 +0300
+
+orbiscreen (0.27.5~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.27.5 for Ubuntu noble.
+  * Fix USB AOA concurrent multi-device handling: update supervisor to maintain concurrent active bridges and probe Android candidate devices in parallel without blocking (Closes: #77).
+  * Fix Android USB accessory permission flow and fallback: add accessory list fallback and update mutable PendingIntent with FLAG_UPDATE_CURRENT (Closes: #77).
+  * Update battery optimization setting to interactive SwitchPreferenceRow with direct system permission and settings intent launching (Closes: #77).
+  * Enable app-wide keepScreenAwake using FLAG_KEEP_SCREEN_ON at Activity window level (Closes: #77).
+  * Polish UI: vertically center USB audio warning container and round ripple selection highlights on all cards and preference rows.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 11 Sep 2026 16:20:00 +0300
+
+orbiscreen (0.27.4~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.27.4 for Ubuntu noble.
+  * Fix Android USB AOA accessory detection and auto-connect: register receiver with RECEIVER_EXPORTED, add onResume initialization, and enable replay cache for autoConnectEvent (Closes: #77).
+  * Fix keepScreenAwake flag: resolve Activity window through Context.findActivity() and set keepScreenOn directly on Compose View (Closes: #77).
+  * Add battery optimization exemption setting in Android app with live status tracking and direct intent launcher (Closes: #77).
+  * Update USB Hero Card to continuously probe and initialize AOA accessory without requiring app restart.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 11 Sep 2026 13:20:00 +0300
+
+orbiscreen (0.27.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.27.3 for Ubuntu noble.
+  * Fix Android client audio playback: configure AudioAttributes with USAGE_MEDIA, enable audio focus handling, and ensure audio tracks are explicitly enabled (Closes: #77).
+  * Fix Android AudioTrack buffer starvation: increase DefaultLoadControl buffer durations to prevent immediate underrun and audio muting.
+  * Fix audio decoder selection: bypass low-latency hardware filter for audio MIME types to preserve standard software audio decoders.
+  * Enforce host audio pipeline standard: specify 48 kHz stereo PCM and standard ADTS stream format framing for AAC in MPEG-TS multiplexer.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 11 Sep 2026 10:25:00 +0300
+
+orbiscreen (0.27.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.27.2 for Ubuntu noble.
+  * Fix video stream periodic freezing: remove false-positive seekToDefaultPosition loop that reset player every 4 s (Closes: #77).
+  * Fix audio pipeline multiplexing: add dedicated upstream-leaky queues for both video and audio before mpegtsmux to prevent frame stalls and audio dropouts (Closes: #77).
+  * Fix virtual sink display name: format sink_properties to display cleanly as "Orbiscreen Audio" with space in system sound settings.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 11 Sep 2026 09:11:00 +0300
+
+orbiscreen (0.27.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.27.1 for Ubuntu noble.
+  * Fix Trackpad mode: cursor no longer jumps to primary screen on finger lift; RelativeMove now uses true relative mouse events on host (Closes: #77).
+  * Fix Trackpad tap-to-click: accumulated cursor position now tracked client-side so clicks land at correct location.
+  * Fix latency accumulation after long sessions: hard-drop seek when buffered lag exceeds 80 ms, EWMA clock smoothing, keyframe protection from stale drop (Closes: #77).
+  * Fix toolbar auto-close: session toolbar no longer closes automatically after 12 s.
+  * Add virtual audio sink: "Orbiscreen Audio" now appears as a system audio output device in PipeWire/PulseAudio.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 11 Sep 2026 06:41:00 +0300
+
+orbiscreen (0.26.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.26.0 for Ubuntu noble.
+  * Fix video stream latency accumulation on Wi-Fi and USB/AOA: stale frame drop at 75 ms (Closes: #77).
+  * Fix rubberbanding: aggressively reduce all pipeline buffers from 128 frames to <=8 (Closes: #75).
+  * Reduce GOP keyframe interval from 600 to 120 frames for faster decoder recovery after frame drops.
+  * USB Audio Output is now fully wired to server pipeline via audio=1 query parameter with BETA badge.
+  * Replace Input Mode switch in session sheet with Segmented Button in main settings only.
+  * Add USB audio experimental warning card in settings.
+
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 11 Sep 2026 01:25:00 +0300
+
+orbiscreen (0.25.9~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.25.9 for Ubuntu noble.
+  * Fix USB AOA black screen and ADB endpoint collision (Closes: #76).
+  * Eliminate rubberbanding on USB reconnect and long session clock drift (Closes: #75).
+  * Remove automatic set_resolution D-Bus call on session start.
+  * Single-tap floating pill toolbar restore without double-tap requirement.
+  * Compact in-session display settings sheet with Fit/Fill/100% and touch modes.
+  * Android M3 preference rows with Dialog radio pickers for Theme and Language.
+  * Full light mode and dark mode WCAG AA color contrast audit.
+  * Desktop GUI 500ms D-Bus timeout protection and dynamic WebKitGTK Tauri invoke.
+  * Clean Arabic localization with natural phrasing and typography.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 10 Sep 2026 18:15:00 +0300
+
+orbiscreen (0.25.8~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.25.8 for Ubuntu noble.
+  * USB audio streaming to device speaker or headphones.
+  * Native physical screen resolution and high refresh rate auto-detection.
+  * Low-latency USB pipeline optimization with reduced buffer queues.
+  * Auto-connect on USB accessory attachment and instant disconnect on detachment.
+  * Full Arabic localization with bundled NotoKufiArabic typography.
+  * Draggable floating edge pill toolbar controls.
+  * Streamlined practical settings redesign.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 09 Sep 2026 15:45:00 +0300
+
+orbiscreen (0.25.7~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.25.7 for Ubuntu noble.
+  * Dual USB pipeline restoration with automatic ADB reverse supervisor.
+  * Android runtime USB accessory permissions via PendingIntent.
+  * D-Bus query timeout protection against suspended or zombie daemon process hangs.
+  * Desktop GUI real-time connected device and model identification.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 09 Sep 2026 03:00:00 +0300
+
+orbiscreen (0.25.6~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.25.6 for Ubuntu noble.
+  * Revert ExoPlayer threshold regression from v0.25.5 that caused worse rubberbanding (#75).
+  * Restore shouldDropOutputBuffer threshold to 30ms; revert setMaxPlaybackSpeed to 1.0f.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Tue, 09 Sep 2026 00:00:00 +0300
+
+orbiscreen (0.25.5~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.25.5 for Ubuntu noble.
+  * Fix 30-minute latency drift and rubberbanding on USB AOA on Android devices (#75).
+  * Configure micro-catchup playback speed (1.00x-1.02x) to absorb quartz oscillator clock drift.
+  * Add proactive on-demand IDR keyframe recovery when lag exceeds 120ms.
+  * Tighten Android USB proxy socket buffers to 16KB and cap accessory buffer expansion to 128KB.
+  * Enable periodic encoder recovery keyframes every 10 seconds (600 frames at 60fps).
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Tue, 08 Sep 2026 21:00:00 +0300
+
+orbiscreen (0.25.4~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.25.4 for Ubuntu noble.
+  * Desktop GUI native Control Center redesign (560x620) with live virtual monitor card.
+  * Zero-inline-comments enforcement across Rust, Kotlin, JS, HTML, and CSS codebases.
+  * Configuration files comment standardization with standard banners and section dividers.
+  * Clean up dead code, deduplicate variables, and fix vector QR code generation.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Tue, 08 Sep 2026 20:00:00 +0300
+
+orbiscreen (0.25.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.25.3 for Ubuntu noble.
+  * Eliminate USB AOA buffer bloat with bounded sync channel and TCP buffer limits (#75).
+  * Lock ExoPlayer live playback rate to 1.0f to eliminate rubberbanding during window drags.
+  * Reconfigure loadControl buffer durations to prevent zero-window TCP read stalls.
+  * Add aggressive late frame dropping in LowLatencyVideoRenderer to stay on live edge.
+  * Optimize Android UsbAccessoryManager socket options and buffer bounds.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Tue, 08 Sep 2026 19:10:00 +0300
+
+orbiscreen (0.25.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.25.2 for Ubuntu noble.
+  * Complete desktop GUI redesign with CSD header bar and virtual display mockup.
+  * System tray icon integration with app.default_window_icon().
+  * Wayland StartupWMClass alignment and full hicolor icon theme set.
+  * Automated NVIDIA explicit sync workarounds in GUI and desktop entry.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Tue, 08 Sep 2026 18:20:00 +0300
+
+orbiscreen (0.25.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.25.1 for Ubuntu noble.
+  * Measure UDP PMTU without truncated ACKs or fragments (PR #74 by @sentinelt).
+  * Immediate fail on unsendable datagrams (EMSGSIZE, drop_above) instead of timeout.
+  * Reset Android DatagramPacket receive cap and expand buffer to 65507 bytes.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Tue, 08 Sep 2026 15:20:00 +0300
+
+orbiscreen (0.25.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.25.0 for Ubuntu noble.
+  * Linux Desktop GUI Control Center (orbiscreen-gui) with System Tray.
+  * Integration of 'orbiscreen gui' CLI command and desktop entry launcher.
+  * Streamlined English user interface across Web, Android, and Desktop.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Tue, 08 Sep 2026 12:30:00 +0300
+
+orbiscreen (0.24.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.24.1 for Ubuntu noble.
+  * UDP Annex-B video transport with per-client DPLPMTUD.
+  * KWin dynamic virtual display with Direct Touch binding.
+  * Send-to-assemble delay metrics in Android stream menu.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 07 Sep 2026 22:50:00 +0300
+
+orbiscreen (0.24.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.24.0 for Ubuntu noble.
+  * Harmonize UI/UX and Catppuccin Mocha colors between Web and Android clients.
+  * Remove Blank Display action from Web and Android interfaces.
+  * Update Web client logo to authentic Orbiscreen vector SVG and rename spinner to streamSpinner.
+  * Strengthen Web Content-Security-Policy (CSP) headers.
+  * Sanitize and clamp daemon input coordinates to prevent NaN/out-of-bounds events.
+  * Enforce clean comment standards and remove dead code across the workspace.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 07 Sep 2026 15:10:00 +0300
+
+orbiscreen (0.23.9~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.23.9 for Ubuntu noble.
+  * Purge GitHub Deployments and gh-pages deployment branch.
+  * Streamline packaging workflows via official Launchpad PPA and Fedora COPR.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 07 Sep 2026 12:30:00 +0300
+
+orbiscreen (0.23.8~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.23.8 for Ubuntu noble.
+  * Multi-target GitHub Deployments tracking (Launchpad-PPA, Fedora-RPM, GitHub-Releases, github-pages).
+  * Automated direct APT repository sync on GitHub Pages.
+  * Standard GitHub Markdown issue templates (bug reports & feature requests) and sponsor links.
+  * Redesigned social preview branding 100% aligned with official vector banner artwork.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 07 Sep 2026 07:16:00 +0300
+
+orbiscreen (0.23.7~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.23.7 for Ubuntu noble.
+  * Enable infinite GOP length using encoder maximum (key-int-max / gop-size).
+  * Enable periodic intra-refresh for software x264enc to keep P-frames small.
+  * Implement on-demand IDR recovery via POST /api/control (action=idr), new stream join, and client error handlers (PR #72 by @sentinelt).
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 07 Sep 2026 02:30:00 +0300
+
+orbiscreen (0.23.6~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.23.6 for Ubuntu noble.
+  * Probe GStreamer vah264enc hardware encoder and fallback through NVENC candidates.
+  * Emit warning when falling back to software x264enc to prevent silent high CPU encode on 1440p+.
+  * Tune VA-API pipeline for low latency (CBR, target-usage=7, ref-frames=1, no B-frames) (PR #71 by @sentinelt).
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Mon, 07 Sep 2026 02:00:00 +0300
+
+orbiscreen (0.23.5~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.23.5 for Ubuntu noble.
+  * Shrink HTTP MPEG-TS transport queues to 4 appsink buffers and 16-slot channel.
+  * Backpressure instead of dropping TS packets; resync stalled appsrc on next keyframe.
+  * Cut Android ExoPlayer live offset to 24ms and enable MediaCodec low-latency decoding (PR #70 by @sentinelt).
+  * Tighten web mpegts.js live sync target to 30ms.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 06 Sep 2026 14:50:00 +0300
+
+orbiscreen (0.23.4~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.23.4 for Ubuntu noble.
+  * Confine trackpad pointer motion and clicks to the virtual display via virtual tablet routing.
+  * Eliminate duplicated mouse click injection during stylus drawing.
+  * Scale Android trackpad motion deltas proportionally to stream content dimensions.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 06 Sep 2026 14:30:00 +0300
+
+orbiscreen (0.23.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.23.3 for Ubuntu noble.
+  * Enable Gradle dependency caching (cache: gradle) in CI workflows to eliminate Cloudflare 403 Forbidden errors.
+  * Add in-page HTML anchor and direct web tab links for Code of Conduct navigation.
+  * Refresh community standards badges and documentation links.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 06 Sep 2026 08:35:00 +0300
+
+orbiscreen (0.23.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.23.2 for Ubuntu noble.
+  * Fix black screen, video freezing, and visual glitches over USB AOA transport.
+  * Eliminate arbitrary TCP/MPEG-TS chunk dropping in GStreamer appsink and AOA bridge.
+  * Retain clean IDR keyframe skipping at the H.264 broadcast channel level.
+  * Tune Android ExoPlayer buffer thresholds to 40ms to prevent decoder starvation at 60 FPS.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 06 Sep 2026 07:45:00 +0300
+
+orbiscreen (0.23.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.23.1 for Ubuntu noble.
+  * Restore direct touch as a virtual multitouch device on Orbiscreen Virtual Touchscreen.
+  * Inject evdev type-B multi-touch slots (ABS_MT_SLOT, ABS_MT_TRACKING_ID, ABS_MT_POSITION_X/Y, BTN_TOUCH).
+  * Send per-finger Touch payload from Android client with 60Hz motion coalescing.
+  * Retain dedicated touchpad mode for virtual mouse cursor navigation.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 06 Sep 2026 06:58:00 +0300
+
+orbiscreen (0.23.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.23.0 for Ubuntu noble.
+  * Optimize USB and stream pipeline: configure 1-buffer drop=true appsink in mpegtsmux.
+  * Reduce bounded video frame channel and drop stale frames to eliminate accumulated latency.
+  * Implement dual-channel AOA USB writer separating high-priority control/input responses from video egress.
+  * Robust interface 0 claim with USBDEVFS_DISCONNECT_CLAIM (flags=0) and retry loop to detach kernel drivers cleanly.
+  * Tune Android ExoPlayer buffer down to 15-45ms and live target offset to 15ms.
+  * Prevent Android app termination on USB accessory detachment and pop gracefully to discovery screen.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sun, 06 Sep 2026 06:50:00 +0300
+
+orbiscreen (0.22.9~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.22.9 for Ubuntu noble.
+  * Fix AOA USB packet truncation in UsbAccessoryManager causing session token loss and auth=missing rejections.
+  * Replace readFully per-field approach with streaming accumulator buffer in handleUsbIncoming.
+  * Properly shutdown TcpStream on FRAME_FLAG_CLOSE in Linux AOA bridge to prevent resource leaks.
+  * Add forceRefresh flag to freshToken() to avoid redundant HTTP requests during stream setup.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 06 Sep 2026 01:20:00 +0300
+
+orbiscreen (0.22.8~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.22.8 for Ubuntu noble.
+  * Embed full multi-vendor Android udev rules in orbiscreen doctor --fix.
+  * Add resilient session token retry logic in Android client.
+  * Eliminate race conditions on AOA stream startup and 401 unauthorized errors.
+  * Add non-root diagnostic guidance for direct USB streaming and USB Tethering.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 05 Sep 2026 21:40:00 +0300
+
+orbiscreen (0.22.7~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.22.7 for Ubuntu noble.
+  * Purge all legacy ADB dependencies and polling across daemon and transport.
+  * Implement unprivileged udev rules for Android Open Accessory (AOA) mode streaming.
+  * Add progressive real-time diagnostic output in orbiscreen doctor without freezing.
+  * Redesign Android in-app update dialog with Compose Markdown renderer and auto-installation.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 05 Sep 2026 20:10:00 +0300
+
+orbiscreen (0.22.6~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.22.6 for Ubuntu noble.
+  * Implement native USB Direct streaming via Android Open Accessory (AOA) protocol.
+  * Provide native Linux usbfs ioctl transport with zero third-party crate dependencies.
+  * Add automatic AOA intent handling and accessory filter in Android client.
+  * Unify and polish tool-oriented translations across Web, Android, and CLI interfaces.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 05 Sep 2026 19:15:00 +0300
+
+orbiscreen (0.22.5~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.22.5 for Ubuntu noble.
+  * Implement native in-app Android updater with live progress, SHA-256 verification, and PackageInstaller.
+  * Add automatic background update check on app launch and manual check in Settings.
+  * Configure secure FileProvider and REQUEST_INSTALL_PACKAGES permission in AndroidManifest.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 05 Sep 2026 17:05:00 +0300
+
+orbiscreen (0.22.4~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.22.4 for Ubuntu noble.
+  * Restrict mouse key bitmask to pure keyboard and mouse buttons so libinput and KWin correctly classify it as pointer instead of tablet-pad.
+  * Implement USB Tethering auto-discovery in Android client to support direct cable connections without ADB.
+  * Add styled ASCII stop card for CLI stop command with Catppuccin accents and D-Bus service status.
+  * Register org.shadow-x78.Orbiscreen well-known name on the session bus.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 05 Sep 2026 16:50:00 +0300
+
+orbiscreen (0.22.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.22.3 for Ubuntu noble.
+  * Eliminate video stuttering and packet bursts by increasing GOP interval to 60 frames (1 keyframe per second).
+  * Make virtual mouse an absolute pointer device without REL_X/REL_Y to eliminate cursor snapback.
+  * Confine cursor strictly to the virtual secondary screen during touch, drag, and stylus input.
+  * Fix stylus tablet tool proximity release to prevent cursor jumping to host display on pen lift.
+  * Tune Android input dispatcher loop to 16ms (60 Hz) to avoid uplink Wi-Fi network congestion.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 05 Sep 2026 13:30:00 +0300
+
+orbiscreen (0.22.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.22.2 for Ubuntu noble.
+  * Fix video stuttering and packet drops by expanding buffers and preventing EOS on overrun.
+  * Confine mouse pointer strictly to virtual screen and prevent snapback to host monitor.
+  * Fix stylus touch, pressure and hover for drawing and desktop navigation on tablets.
+  * Tune ExoPlayer buffer for stutter-free 60 FPS streaming over USB ADB and Wi-Fi.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 05 Sep 2026 12:35:00 +0300
+
+orbiscreen (0.22.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.22.1 for Ubuntu noble.
+  * Ultra-low latency streaming optimizations with is-live=false pipeline.
+  * Dedicated uinput devices: mouse/keyboard, touchscreen, and tablet.
+  * Bound touchscreen and tablet to Virtual-ORBISCREEN via KWin D-Bus.
+  * Non-zero axis resolution for tablet device to ensure libinput stylus recognition.
+  * Low-latency playback buffer tuning and async input dispatch in Android client.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 05 Sep 2026 02:15:00 +0300
+
+orbiscreen (0.22.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.22.0 for Ubuntu noble.
+  * Absolute pointer mapping for virtual uinput mouse to prevent snapback.
+  * Direct touch precision with atomic FIFO pointer event dispatch.
+  * Fix green screen video artifact by preventing MPEG-TS packet drops.
+  * Streamline CLI startup banner and update packaging metadata.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Sat, 05 Sep 2026 00:30:00 +0300
+
+orbiscreen (0.21.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.21.0 for Ubuntu noble.
+  * Rich developer version card and ASCII banner on orbiscreen -V.
+  * Full bilingual i18n support in web client, Android app, and documentation.
+  * Translated Arabic architecture diagrams and documentation polishing.
+  * Token security hardening and streamline packaging metadata.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 04 Sep 2026 22:30:00 +0300
+
+orbiscreen (0.20.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.20.0 for Ubuntu noble.
+  * XDG Desktop Portal ScreenCast API for rootless virtual display outputs.
+  * Stylus digitizer overhaul: hover events, tilt angle correction, and zero-latency pressure release.
+  * Double-tap and drag mouse gesture in touchpad mode.
+  * ChromeOS ARC++ ADB connection support.
+  * LAN token security isolation, loopback filtering, and 0o600 token storage.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 04 Sep 2026 18:00:00 +0300
+
+orbiscreen (0.19.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.19.0 for Ubuntu noble.
+  * Full COSMIC desktop support (cosmic-comp / Smithay) with evdi -> portal fallback.
+  * Automated diagnostic tooling and auto-fix integration in orbiscreen doctor.
+  * Native Fedora CI and RPM packaging pipeline with RPM Fusion.
+  * Comprehensive RTL documentation, zero-comment code standards, and security hardening.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Fri, 04 Sep 2026 16:20:00 +0300
+
+orbiscreen (0.18.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.18.3 for Ubuntu noble.
+  * Android 1:1 web client parity: direct keyboard typing via hidden IME, Material 3 hotkey overlay.
+  * Streamlined overlay states, VNC cursor isolation, and brand SVG/PNG favicons.
+  * Refined CLI ASCII logo geometry and standardized command outputs.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Thu, 04 Sep 2026 03:50:00 +0300
+
+orbiscreen (0.18.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.18.2 for Ubuntu noble.
+  * Modernized CLI interface with brand theme, ASCII logo, and status command.
+  * Cleaned codebase and standardized credit headers across all source files.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 03 Sep 2026 21:30:00 +0300
+
+orbiscreen (0.18.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.18.1 for Ubuntu noble.
+  * Pure CLI daemon refactoring: removed desktop application launcher.
+  * Synchronized package metadata descriptions across all Linux distributions.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 03 Sep 2026 18:00:00 +0300
+
+orbiscreen (0.18.0~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.18.0 for Ubuntu noble.
+  * Native Graphic Digitizer with stylus pressure/tilt (4095 levels, Krita/GIMP support).
+  * Auto-orientation: virtual display adapts aspect ratio automatically on device rotation.
+  * SEO-optimized README and Arabic README with rich shields, viral sharing buttons.
+  * Professional SVG banner with crisp vector icons replacing emoji.
+  * Packaging: updated .deb, .rpm, and AppImage CLI distributions.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 03 Sep 2026 16:00:00 +0300
+
+orbiscreen (0.17.4~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.17.4 for Ubuntu noble.
+  * Ultra-low latency KWin virtual capture (framerate-matched damage pump, drop=true max-buffers=1), zero-backlog keyframe delivery, hardware NVENC prioritization, double-tap gesture fix, redesigned Arabic exit modal and settings bottom sheet.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 02 Sep 2026 17:15:00 +0300
+
+orbiscreen (0.17.3~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.17.3 for Ubuntu noble.
+  * Streaming pitch-black fix, sleek keyboard accessory bar, settings FAB & sheet redesign, exit confirmation modal.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 02 Sep 2026 16:35:00 +0300
+
+orbiscreen (0.17.2~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.17.2 for Ubuntu noble.
+  * Comprehensive UI/UX overhaul, sub-100ms latency, mouse input fix, background auto-resume.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 02 Sep 2026 15:55:00 +0300
+
+orbiscreen (0.17.1~ubuntunoble1) noble; urgency=medium
+
+  * Release 0.17.1 for Ubuntu noble.
+  * In-app developer credits, GitHub links, update check, zero-buffering playback.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 02 Sep 2026 15:10:00 +0300
+
+orbiscreen (0.16.2~ubuntu24.04.3) noble; urgency=medium
+
+  * Release 0.16.2 for Ubuntu noble.
+  * Fast offline Launchpad PPA packaging with explicit dependencies.
+  * Include machine-readable debian/copyright file.
+
+ -- shadow-x78 <107577376+shadow-x78@users.noreply.github.com>  Wed, 02 Sep 2026 06:02:26 +0300

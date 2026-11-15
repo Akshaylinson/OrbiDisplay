@@ -1,0 +1,140 @@
+
+package com.orbiscreen.android.data
+
+import android.content.Context
+import android.content.SharedPreferences
+import androidx.core.content.edit
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+
+data class RecentHost(
+    val host: String,
+    val port: Int,
+    val timestampMs: Long = System.currentTimeMillis(),
+)
+
+class PrefsStore(context: Context) {
+    private val prefs: SharedPreferences =
+        context.getSharedPreferences("orbiscreen_prefs", Context.MODE_PRIVATE)
+
+    enum class ThemePref { System, Light, Dark }
+
+    var recentHost: RecentHost?
+        get() {
+            val host = prefs.getString(KEY_RECENT_HOST, null) ?: return null
+            val port = prefs.getInt(KEY_RECENT_PORT, 8788)
+            val ts = prefs.getLong(KEY_RECENT_TS, 0L)
+            return RecentHost(host, port, ts)
+        }
+        set(value) {
+            prefs.edit {
+                if (value == null) {
+                    remove(KEY_RECENT_HOST); remove(KEY_RECENT_PORT); remove(KEY_RECENT_TS)
+                } else {
+                    putString(KEY_RECENT_HOST, value.host)
+                    putInt(KEY_RECENT_PORT, value.port)
+                    putLong(KEY_RECENT_TS, value.timestampMs)
+                }
+            }
+        }
+
+    var themePref: ThemePref
+        get() = when (prefs.getString(KEY_THEME, ThemePref.System.name)) {
+            ThemePref.Light.name -> ThemePref.Light
+            ThemePref.Dark.name -> ThemePref.Dark
+            else -> ThemePref.System
+        }
+        set(value) { prefs.edit { putString(KEY_THEME, value.name) } }
+
+    val themePrefFlow: Flow<ThemePref> = callbackFlow {
+        trySend(themePref)
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == KEY_THEME) trySend(themePref)
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        awaitClose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }.distinctUntilChanged()
+
+    var appLanguage: String
+        get() = prefs.getString(KEY_LANGUAGE, "system") ?: "system"
+        set(value) { prefs.edit { putString(KEY_LANGUAGE, value) } }
+
+    val appLanguageFlow: Flow<String> = callbackFlow {
+        trySend(appLanguage)
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == KEY_LANGUAGE) trySend(appLanguage)
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        awaitClose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }.distinctUntilChanged()
+
+    var keepScreenAwake: Boolean
+        get() = prefs.getBoolean(KEY_KEEP_SCREEN_AWAKE, true)
+        set(value) { prefs.edit { putBoolean(KEY_KEEP_SCREEN_AWAKE, value) } }
+
+    val keepScreenAwakeFlow: Flow<Boolean> = callbackFlow {
+        trySend(keepScreenAwake)
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == KEY_KEEP_SCREEN_AWAKE) trySend(keepScreenAwake)
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        awaitClose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }.distinctUntilChanged()
+
+    var autoConnectUsb: Boolean
+        get() = prefs.getBoolean(KEY_AUTO_CONNECT_USB, true)
+        set(value) { prefs.edit { putBoolean(KEY_AUTO_CONNECT_USB, value) } }
+
+    var forceSoftwareDecoder: Boolean
+        get() = prefs.getBoolean(KEY_SW_DECODER, false)
+        set(value) { prefs.edit { putBoolean(KEY_SW_DECODER, value) } }
+
+    var usbPort: Int
+        get() = prefs.getInt(KEY_USB_PORT, DEFAULT_USB_PORT).coerceIn(1024, 65535)
+        set(value) { prefs.edit { putInt(KEY_USB_PORT, value.coerceIn(1024, 65535)) } }
+
+    var pointerSpeed: Float
+        get() = prefs.getFloat(KEY_POINTER_SPEED, 1.0f).coerceIn(0.3f, 3.0f)
+        set(value) { prefs.edit { putFloat(KEY_POINTER_SPEED, value.coerceIn(0.3f, 3.0f)) } }
+
+    var touchMode: Boolean
+        get() = prefs.getBoolean(KEY_TOUCH_MODE, true)
+        set(value) { prefs.edit { putBoolean(KEY_TOUCH_MODE, value) } }
+
+    var scaleMode: String
+        get() = prefs.getString(KEY_SCALE_MODE, "fit") ?: "fit"
+        set(value) { prefs.edit { putString(KEY_SCALE_MODE, value) } }
+
+    var resolutionPreset: String
+        get() = prefs.getString(KEY_RESOLUTION_PRESET, "native") ?: "native"
+        set(value) { prefs.edit { putString(KEY_RESOLUTION_PRESET, value) } }
+
+    var showStats: Boolean
+        get() = prefs.getBoolean(KEY_SHOW_STATS, false)
+        set(value) { prefs.edit { putBoolean(KEY_SHOW_STATS, value) } }
+    fun clearRecent() {
+        prefs.edit {
+            remove(KEY_RECENT_HOST); remove(KEY_RECENT_PORT); remove(KEY_RECENT_TS)
+        }
+    }
+
+    companion object {
+        const val DEFAULT_USB_PORT = 8788
+        private const val KEY_RECENT_HOST = "recent_host"
+        private const val KEY_RECENT_PORT = "recent_port"
+        private const val KEY_RECENT_TS = "recent_ts"
+        private const val KEY_THEME = "theme_pref"
+        private const val KEY_LANGUAGE = "app_language"
+        private const val KEY_KEEP_SCREEN_AWAKE = "keep_screen_awake"
+        private const val KEY_AUTO_CONNECT_USB = "auto_connect_usb"
+        private const val KEY_SW_DECODER = "sw_decoder"
+        private const val KEY_USB_PORT = "usb_port"
+        private const val KEY_POINTER_SPEED = "pointer_speed"
+        private const val KEY_TOUCH_MODE = "touch_mode"
+        private const val KEY_SCALE_MODE = "scale_mode"
+        private const val KEY_RESOLUTION_PRESET = "resolution_preset"
+        private const val KEY_SHOW_STATS = "show_stats"
+    }
+}

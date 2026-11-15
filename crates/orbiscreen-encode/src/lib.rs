@@ -1,0 +1,1124 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use gstreamer::glib;
+use gstreamer::prelude::*;
+use gstreamer::{ClockTime, ElementFactory, Pipeline};
+use gstreamer_app::{AppSink, AppSinkCallbacks, AppSrc};
+use orbiscreen_core::frame_pool::PooledFrameBuffer;
+use thiserror::Error;
+use tokio::sync::mpsc;
+use tracing::{info, instrument, warn};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderKind {
+    Auto,
+    Nvenc,
+    Vaapi,
+    X264,
+}
+
+impl EncoderKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "vaapi" => Some(Self::Vaapi),
+            "nvenc" => Some(Self::Nvenc),
+            "x264" => Some(Self::X264),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Nvenc => "nvenc",
+            Self::Vaapi => "vaapi",
+            Self::X264 => "x264",
+        }
+    }
+
+    pub fn gst_element(self) -> &'static str {
+        match self {
+            Self::Auto => "nvh264enc",
+            other => other.gst_candidates()[0],
+        }
+    }
+
+    fn gst_candidates(self) -> &'static [&'static str] {
+        match self {
+            Self::Auto => Self::Nvenc.gst_candidates(),
+            Self::Nvenc => &["nvh264enc", "nvcudah264enc", "nvautogpuh264enc"],
+            Self::Vaapi => &["vah264enc", "vaapih264enc"],
+            Self::X264 => &["x264enc"],
+        }
+    }
+}
+
+impl std::fmt::Display for EncoderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EncodeParams {
+    pub kind: EncoderKind,
+    pub bitrate_kbps: u32,
+    pub width: u32,
+    pub height: u32,
+    pub framerate: u32,
+    pub gop_on_demand: bool,
+}
+
+impl Default for EncodeParams {
+    fn default() -> Self {
+        Self {
+            kind: EncoderKind::Auto,
+            bitrate_kbps: 8000,
+            width: 1920,
+            height: 1080,
+            framerate: 60,
+            gop_on_demand: false,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum EncodeError {
+    #[error("pipeline is flushing")]
+    Flushing,
+    #[error("pipeline reached end of stream")]
+    Eos,
+    #[error("gstreamer pipeline error: {0}")]
+    Pipeline(String),
+    #[error("failed to initialize gstreamer: {0}")]
+    Init(String),
+    #[error("frame size {got} B does not match encoder config {expected} B ({width}x{height}x4)")]
+    FrameSizeMismatch {
+        got: usize,
+        expected: usize,
+        width: u32,
+        height: u32,
+    },
+}
+
+pub fn init() -> Result<(), EncodeError> {
+    gstreamer::init().map_err(|e| EncodeError::Init(e.to_string()))
+}
+
+fn element_available(name: &str) -> bool {
+    gstreamer::Registry::get()
+        .find_feature(name, gstreamer::ElementFactory::static_type())
+        .is_some()
+}
+
+fn first_available_element(kind: EncoderKind) -> Option<&'static str> {
+    kind.gst_candidates()
+        .iter()
+        .copied()
+        .find(|name| element_available(name))
+}
+
+fn hardware_candidate_list() -> String {
+    EncoderKind::Nvenc
+        .gst_candidates()
+        .iter()
+        .chain(EncoderKind::Vaapi.gst_candidates().iter())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn detect_available(preferred: EncoderKind) -> (EncoderKind, &'static str) {
+    let search_order = match preferred {
+        EncoderKind::Auto | EncoderKind::Nvenc => {
+            [EncoderKind::Nvenc, EncoderKind::Vaapi, EncoderKind::X264]
+        }
+        EncoderKind::Vaapi => [EncoderKind::Vaapi, EncoderKind::Nvenc, EncoderKind::X264],
+        EncoderKind::X264 => [EncoderKind::X264, EncoderKind::Nvenc, EncoderKind::Vaapi],
+    };
+    for kind in search_order {
+        if let Some(element) = first_available_element(kind) {
+            if kind == EncoderKind::X264 && preferred != EncoderKind::X264 {
+                warn!(
+                    "no hardware H.264 encoder available (tried {}); using software x264enc, expect high encode latency at 1440p and above",
+                    hardware_candidate_list()
+                );
+            }
+            return (kind, element);
+        }
+    }
+    warn!("no H.264 encoder found; pipeline construction will fail");
+    (EncoderKind::X264, "x264enc")
+}
+
+fn make_element(name: &str) -> Result<gstreamer::Element, EncodeError> {
+    ElementFactory::make(name)
+        .build()
+        .map_err(|e| EncodeError::Pipeline(format!("{name}: {e}")))
+}
+
+fn set_str_if_present(el: &gstreamer::Element, name: &str, value: &str) {
+    if el.find_property(name).is_some() {
+        el.set_property_from_str(name, value);
+    }
+}
+
+fn note_skipped_property(el: &gstreamer::Element, name: &str) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SKIPPED: AtomicU32 = AtomicU32::new(0);
+    let n = SKIPPED.fetch_add(1, Ordering::Relaxed);
+    if n.is_multiple_of(16) {
+        tracing::trace!(
+            encoder = %el.name(),
+            property = name,
+            skipped = n,
+            "encoder does not expose this property; the value was not applied"
+        );
+    }
+}
+
+fn set_u32_if_present(el: &gstreamer::Element, name: &str, value: u32) {
+    let Some(spec) = el.find_property(name) else {
+        note_skipped_property(el, name);
+        return;
+    };
+    if spec.downcast_ref::<glib::ParamSpecUInt>().is_some() {
+        el.set_property(name, value);
+    } else if spec.downcast_ref::<glib::ParamSpecInt>().is_some() {
+        el.set_property(name, value.min(i32::MAX as u32) as i32);
+    } else {
+        el.set_property_from_str(name, &value.to_string());
+    }
+}
+
+pub fn suggested_bitrate_kbps(width: u32, height: u32, framerate: u32) -> u32 {
+    let pps = (width as u64) * (height as u64) * (framerate.max(1) as u64);
+    let kbps = (pps * 8 / 100 / 1000) as u32;
+    kbps.clamp(8_000, 50_000)
+}
+
+pub fn one_frame_vbv_ms(framerate: u32) -> u32 {
+    let fps = framerate.max(1);
+    1000u32.div_ceil(fps)
+}
+
+pub fn one_frame_vbv_kb(bitrate_kbps: u32, framerate: u32, width: u32, height: u32) -> u32 {
+    let from_bitrate = bitrate_kbps.max(1).div_ceil(framerate.max(1)).max(1);
+    let raw_kbit_per_frame =
+        (u64::from(width.max(1)) * u64::from(height.max(1)) * 12 / 1000).max(1) as u32;
+    let latency_floor = raw_kbit_per_frame.saturating_mul(VBV_RAW_FRAME_MULTIPLE);
+    let latency_ceiling =
+        (u64::from(bitrate_kbps.max(1)) * u64::from(MAX_VBV_LATENCY_MS) / 1000).max(1) as u32;
+    from_bitrate
+        .max(latency_floor)
+        .min(latency_ceiling)
+        .max(200)
+}
+
+const VBV_RAW_FRAME_MULTIPLE: u32 = 2;
+
+const MAX_VBV_LATENCY_MS: u32 = 50;
+
+#[derive(Clone, Copy)]
+enum EncoderProp {
+    Str(&'static str),
+    U32(u32),
+}
+
+const NVENC_PROPS: &[(&str, EncoderProp)] = &[
+    ("tune", EncoderProp::Str("ultra-low-latency")),
+    ("zerolatency", EncoderProp::Str("true")),
+    ("preset", EncoderProp::Str("p1")),
+    ("rc-mode", EncoderProp::Str("cbr")),
+    ("repeat-sequence-header", EncoderProp::Str("true")),
+    ("b-frames", EncoderProp::Str("0")),
+    ("qp-max-i", EncoderProp::U32(35)),
+    ("qp-max-p", EncoderProp::U32(38)),
+];
+
+const VAAPI_PROPS: &[(&str, EncoderProp)] = &[
+    ("rate-control", EncoderProp::Str("cbr")),
+    ("b-frames", EncoderProp::Str("0")),
+    ("target-usage", EncoderProp::Str("7")),
+    ("ref-frames", EncoderProp::Str("1")),
+];
+
+const X264_PROPS: &[(&str, EncoderProp)] = &[
+    ("tune", EncoderProp::Str("zerolatency")),
+    ("speed-preset", EncoderProp::Str("ultrafast")),
+    ("sliced-threads", EncoderProp::Str("true")),
+    ("threads", EncoderProp::Str("4")),
+    ("repeat-headers", EncoderProp::Str("true")),
+    ("b-adapt", EncoderProp::Str("0")),
+    ("bframes", EncoderProp::Str("0")),
+];
+
+fn apply_encoder_properties(encoder: &gstreamer::Element, kind: EncoderKind) {
+    let props = match kind {
+        EncoderKind::Nvenc => NVENC_PROPS,
+        EncoderKind::Vaapi => VAAPI_PROPS,
+        EncoderKind::X264 => X264_PROPS,
+        EncoderKind::Auto => &[],
+    };
+    for (name, value) in props {
+        match value {
+            EncoderProp::Str(value) => set_str_if_present(encoder, name, value),
+            EncoderProp::U32(value) => set_u32_if_present(encoder, name, *value),
+        }
+    }
+}
+
+fn configure_one_frame_vbv(
+    encoder: &gstreamer::Element,
+    bitrate_kbps: u32,
+    framerate: u32,
+    width: u32,
+    height: u32,
+) {
+    let vbv_ms = one_frame_vbv_ms(framerate);
+    let vbv_kb = one_frame_vbv_kb(bitrate_kbps, framerate, width, height);
+    set_u32_if_present(encoder, "vbv-buf-capacity", vbv_ms);
+    set_u32_if_present(encoder, "cpb-size", vbv_kb);
+    set_u32_if_present(encoder, "vbv-buffer-size", vbv_kb);
+    set_u32_if_present(encoder, "rc-lookahead", 0);
+    info!(
+        vbv_ms,
+        vbv_kb, bitrate_kbps, framerate, "configured low-latency VBV/CPB buffer"
+    );
+}
+
+fn max_u32_property(el: &gstreamer::Element, name: &str) -> Option<u32> {
+    let spec = el.find_property(name)?;
+    spec.downcast_ref::<glib::ParamSpecUInt>()
+        .map(|p| p.maximum())
+        .or_else(|| {
+            spec.downcast_ref::<glib::ParamSpecInt>()
+                .map(|p| p.maximum() as u32)
+        })
+}
+
+pub fn gop_on_demand_from_env() -> bool {
+    std::env::var("ORBISCREEN_INFINITE_GOP")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn configure_gop(encoder: &gstreamer::Element, on_demand: bool) {
+    if on_demand {
+        set_str_if_present(encoder, "intra-refresh", "true");
+    }
+    if let Some(max) = max_u32_property(encoder, "key-int-max") {
+        let value = if on_demand {
+            if max == 0 {
+                u32::MAX
+            } else {
+                max
+            }
+        } else if max == 0 {
+            120
+        } else {
+            max.min(120)
+        };
+        encoder.set_property_from_str("key-int-max", &value.to_string());
+    }
+    if encoder.find_property("gop-size").is_some() {
+        if let Some(spec) = encoder.find_property("gop-size") {
+            if spec.downcast_ref::<glib::ParamSpecInt>().is_some() {
+                if on_demand {
+                    encoder.set_property_from_str("gop-size", "-1");
+                } else {
+                    encoder.set_property_from_str("gop-size", "120");
+                }
+            } else if let Some(max) = max_u32_property(encoder, "gop-size") {
+                let value = if on_demand {
+                    if max == 0 {
+                        u32::MAX
+                    } else {
+                        max
+                    }
+                } else if max == 0 {
+                    120
+                } else {
+                    max.min(120)
+                };
+                encoder.set_property_from_str("gop-size", &value.to_string());
+            }
+        }
+    }
+    if let Some(max) = max_u32_property(encoder, "keyframe-period") {
+        let value = if on_demand {
+            if max == 0 {
+                u32::MAX
+            } else {
+                max
+            }
+        } else if max == 0 {
+            120
+        } else {
+            max.min(120)
+        };
+        encoder.set_property_from_str("keyframe-period", &value.to_string());
+    }
+    if encoder
+        .find_property("min-force-key-unit-interval")
+        .is_some()
+    {
+        encoder.set_property("min-force-key-unit-interval", 250_000_000u64);
+    }
+}
+
+fn force_key_unit_event() -> gstreamer::Event {
+    let structure = gstreamer::Structure::builder("GstForceKeyUnit")
+        .field("all-headers", true)
+        .field("count", 0u32)
+        .build();
+    gstreamer::event::CustomUpstream::new(structure)
+}
+
+#[derive(Debug, Clone)]
+pub struct EncodedChunk {
+    pub bytes: Vec<u8>,
+    pub is_keyframe: bool,
+    pub pts_ns: u64,
+}
+
+#[allow(missing_debug_implementations)]
+pub struct Encoder {
+    pipeline: Pipeline,
+    appsrc: AppSrc,
+    encoder: gstreamer::Element,
+    kind: EncoderKind,
+    width: u32,
+    height: u32,
+    rx: Option<mpsc::Receiver<EncodedChunk>>,
+    last_key_request_ns: AtomicU64,
+}
+
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        let _ = self.pipeline.set_state(gstreamer::State::Null);
+    }
+}
+
+impl Encoder {
+    #[instrument(skip_all, fields(width = params.width, height = params.height))]
+    pub fn new(params: EncodeParams) -> Result<Self, EncodeError> {
+        init()?;
+        let (kind, encoder_el) = detect_available(params.kind);
+        match Self::build_pipeline(&params, kind, encoder_el) {
+            Ok(enc) => Ok(enc),
+            Err(e) if kind != EncoderKind::X264 => {
+                warn!(
+                    "Hardware encoder {encoder_el} failed to initialize ({e}); falling back to software x264"
+                );
+                Self::build_pipeline(&params, EncoderKind::X264, EncoderKind::X264.gst_element())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn build_pipeline(
+        params: &EncodeParams,
+        kind: EncoderKind,
+        encoder_el: &'static str,
+    ) -> Result<Self, EncodeError> {
+        info!(?kind, element = encoder_el, "Using GStreamer encoder");
+        let encoder = make_element(encoder_el)?;
+
+        let appsrc = ElementFactory::make("appsrc")
+            .build()
+            .map_err(|e| EncodeError::Pipeline(format!("appsrc: {e}")))?
+            .downcast::<AppSrc>()
+            .map_err(|_| EncodeError::Pipeline("appsrc downcast".into()))?;
+
+        let videoconvert = make_element("videoconvert")?;
+        set_str_if_present(&videoconvert, "n-threads", "4");
+
+        let appsink = ElementFactory::make("appsink")
+            .build()
+            .map_err(|e| EncodeError::Pipeline(format!("appsink: {e}")))?
+            .downcast::<AppSink>()
+            .map_err(|_| EncodeError::Pipeline("appsink downcast".into()))?;
+        appsink.set_sync(false);
+        appsink.set_drop(true);
+        appsink.set_max_buffers(1);
+        appsink.set_caps(Some(
+            &gstreamer::Caps::builder("video/x-h264")
+                .field("stream-format", "byte-stream")
+                .field("alignment", "au")
+                .build(),
+        ));
+
+        let pipeline = Pipeline::new();
+        pipeline
+            .add_many([
+                appsrc.upcast_ref(),
+                &videoconvert,
+                &encoder,
+                appsink.upcast_ref(),
+            ])
+            .map_err(|e| EncodeError::Pipeline(format!("add_many: {e}")))?;
+
+        let caps = gstreamer::Caps::builder("video/x-raw")
+            .field("format", "BGRA")
+            .field("width", params.width as i32)
+            .field("height", params.height as i32)
+            .field(
+                "framerate",
+                gstreamer::Fraction::new(params.framerate as i32, 1),
+            )
+            .build();
+        appsrc.set_caps(Some(&caps));
+        appsrc.set_format(gstreamer::Format::Time);
+        appsrc.set_is_live(true);
+        appsrc.set_do_timestamp(false);
+        appsrc.set_max_bytes((params.width as u64) * params.height as u64 * 4);
+
+        if encoder.find_property("bitrate").is_some() {
+            encoder.set_property_from_str("bitrate", &params.bitrate_kbps.to_string());
+        }
+        if encoder.find_property("byte-stream").is_some() {
+            encoder.set_property_from_str("byte-stream", "true");
+        }
+        apply_encoder_properties(&encoder, kind);
+        configure_one_frame_vbv(
+            &encoder,
+            params.bitrate_kbps,
+            params.framerate,
+            params.width,
+            params.height,
+        );
+        configure_gop(&encoder, params.gop_on_demand);
+
+        let h264parse = make_element("h264parse")?;
+        h264parse.set_property_from_str("config-interval", "1");
+
+        let nv12_caps = ElementFactory::make("capsfilter")
+            .build()
+            .map_err(|e| EncodeError::Pipeline(format!("capsfilter: {e}")))?;
+        nv12_caps.set_property(
+            "caps",
+            gstreamer::Caps::builder("video/x-raw")
+                .field("format", "NV12")
+                .build(),
+        );
+
+        pipeline
+            .add(&h264parse)
+            .map_err(|e| EncodeError::Pipeline(format!("add parse: {e}")))?;
+        pipeline
+            .add(&nv12_caps)
+            .map_err(|e| EncodeError::Pipeline(format!("add capsfilter: {e}")))?;
+        gstreamer::Element::link_many([
+            appsrc.upcast_ref(),
+            &videoconvert,
+            &nv12_caps,
+            &encoder,
+            &h264parse,
+            appsink.upcast_ref(),
+        ])
+        .map_err(|e| EncodeError::Pipeline(format!("link parse: {e}")))?;
+
+        let (tx, rx) = mpsc::channel::<EncodedChunk>(64);
+        appsink.set_callbacks(
+            AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = match sink.pull_sample() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("encoder pull_sample error: {e}");
+                            return Err(gstreamer::FlowError::Eos);
+                        }
+                    };
+                    let buffer = sample.buffer().ok_or_else(|| {
+                        warn!("sample had no buffer");
+                        gstreamer::FlowError::Eos
+                    })?;
+                    let map = buffer
+                        .map_readable()
+                        .map_err(|_| gstreamer::FlowError::Eos)?;
+                    let bytes = map.to_vec();
+                    let is_keyframe = !buffer.flags().contains(gstreamer::BufferFlags::DELTA_UNIT);
+                    let Some(pts_ns) = buffer.pts().map(|t| t.nseconds()) else {
+                        tracing::debug!("encoded chunk without PTS dropped");
+                        return Ok(gstreamer::FlowSuccess::Ok);
+                    };
+                    if tx
+                        .try_send(EncodedChunk {
+                            bytes,
+                            is_keyframe,
+                            pts_ns,
+                        })
+                        .is_err()
+                    {
+                        tracing::warn!("encoded chunk dropped: consumer channel full");
+                    }
+                    Ok(gstreamer::FlowSuccess::Ok)
+                })
+                .eos(move |_| {
+                    info!("encoder EOS");
+                })
+                .build(),
+        );
+
+        if let Some(bus) = pipeline.bus() {
+            bus.set_sync_handler(|_bus, msg| {
+                match msg.view() {
+                    gstreamer::MessageView::Error(err) => {
+                        tracing::error!(
+                            target: "orbiscreen_encode",
+                            "GStreamer encoder error: {} (debug: {})",
+                            err.error(),
+                            err.debug().unwrap_or_default()
+                        );
+                    }
+                    gstreamer::MessageView::Warning(warn) => {
+                        tracing::warn!(
+                            target: "orbiscreen_encode",
+                            "GStreamer encoder warning: {} (debug: {})",
+                            warn.error(),
+                            warn.debug().unwrap_or_default()
+                        );
+                    }
+                    _ => {}
+                }
+                gstreamer::BusSyncReply::Drop
+            });
+        }
+
+        pipeline
+            .set_state(gstreamer::State::Playing)
+            .map_err(|e| EncodeError::Pipeline(format!("set_state Playing: {e}")))?;
+
+        if kind != EncoderKind::X264 {
+            if let Some(bus) = pipeline.bus() {
+                if let Some(msg) = bus.timed_pop_filtered(
+                    gstreamer::ClockTime::from_mseconds(50),
+                    &[gstreamer::MessageType::Error],
+                ) {
+                    if let gstreamer::MessageView::Error(err) = msg.view() {
+                        let _ = pipeline.set_state(gstreamer::State::Null);
+                        return Err(EncodeError::Pipeline(format!(
+                            "{}: {}",
+                            err.error(),
+                            err.debug().unwrap_or_default()
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            pipeline,
+            appsrc,
+            encoder,
+            kind,
+            width: params.width,
+            height: params.height,
+            rx: Some(rx),
+            last_key_request_ns: AtomicU64::new(0),
+        })
+    }
+
+    pub fn request_keyframe(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let prev = self.last_key_request_ns.load(Ordering::Relaxed);
+        if now.saturating_sub(prev) < 200_000_000 {
+            return;
+        }
+        self.last_key_request_ns.store(now, Ordering::Relaxed);
+        let Some(pad) = self.encoder.static_pad("src") else {
+            warn!("encoder has no src pad; cannot request IDR");
+            return;
+        };
+        if pad.send_event(force_key_unit_event()) {
+            info!(kind = ?self.kind, "requested IDR from encoder");
+        } else {
+            warn!(kind = ?self.kind, "encoder rejected force-key-unit");
+        }
+    }
+
+    pub fn subscribe(&mut self) -> Option<mpsc::Receiver<EncodedChunk>> {
+        self.rx.take()
+    }
+
+    fn check_frame(&self, len: usize, width: u32, height: u32) -> Result<(), EncodeError> {
+        let expected = self.width as usize * self.height as usize * 4;
+        if len != expected || width != self.width || height != self.height {
+            return Err(EncodeError::FrameSizeMismatch {
+                got: len,
+                expected,
+                width: self.width,
+                height: self.height,
+            });
+        }
+        Ok(())
+    }
+
+    fn push_owned_buffer(
+        &self,
+        mut buffer: gstreamer::Buffer,
+        pts_ns: u64,
+    ) -> Result<(), EncodeError> {
+        {
+            let buffer_mut = buffer.get_mut().ok_or_else(|| {
+                EncodeError::Pipeline("buffer not uniquely owned before push".into())
+            })?;
+            buffer_mut.set_pts(ClockTime::from_nseconds(pts_ns));
+        }
+        self.appsrc.push_buffer(buffer).map_err(|e| match e {
+            gstreamer::FlowError::Flushing => EncodeError::Flushing,
+            gstreamer::FlowError::Eos => EncodeError::Eos,
+            other => EncodeError::Pipeline(format!("push_buffer: {other}")),
+        })?;
+        Ok(())
+    }
+
+    pub fn push_frame(
+        &self,
+        frame: &[u8],
+        width: u32,
+        height: u32,
+        pts_ns: u64,
+    ) -> Result<(), EncodeError> {
+        self.check_frame(frame.len(), width, height)?;
+        let mut buffer = gstreamer::Buffer::with_size(frame.len())
+            .map_err(|e| EncodeError::Pipeline(format!("alloc buffer: {e}")))?;
+        {
+            let buffer_mut = buffer.get_mut().ok_or_else(|| {
+                EncodeError::Pipeline("buffer not uniquely owned after allocation".into())
+            })?;
+            buffer_mut
+                .copy_from_slice(0, frame)
+                .map_err(|e| EncodeError::Pipeline(format!("copy_from_slice: {e}")))?;
+        }
+        self.push_owned_buffer(buffer, pts_ns)
+    }
+
+    pub fn push_frame_owned(
+        &self,
+        frame: PooledFrameBuffer,
+        width: u32,
+        height: u32,
+        pts_ns: u64,
+    ) -> Result<(), EncodeError> {
+        self.check_frame(frame.len(), width, height)?;
+        let buffer = gstreamer::Buffer::from_mut_slice(frame);
+        self.push_owned_buffer(buffer, pts_ns)
+    }
+
+    pub fn stop(&self) {
+        if let Err(e) = self.appsrc.end_of_stream() {
+            warn!("failed to signal EOS on stop: {e}");
+        }
+        let _ = self.pipeline.set_state(gstreamer::State::Null);
+    }
+
+    pub fn frame_duration_ns(framerate: u32) -> u64 {
+        1_000_000_000 / u64::from(framerate).max(1)
+    }
+
+    pub fn kind(&self) -> EncoderKind {
+        self.kind
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_known_encoders() {
+        assert_eq!(EncoderKind::parse("auto"), Some(EncoderKind::Auto));
+        assert_eq!(EncoderKind::parse("x264"), Some(EncoderKind::X264));
+        assert_eq!(EncoderKind::parse("NVENC"), Some(EncoderKind::Nvenc));
+        assert_eq!(EncoderKind::parse("Vaapi"), Some(EncoderKind::Vaapi));
+    }
+
+    #[test]
+    fn rejects_unknown_encoders() {
+        assert_eq!(EncoderKind::parse("vp9"), None);
+        assert_eq!(EncoderKind::parse(""), None);
+    }
+
+    #[test]
+    fn gst_element_names_are_stable() {
+        assert_eq!(EncoderKind::X264.gst_element(), "x264enc");
+        assert_eq!(EncoderKind::Nvenc.gst_element(), "nvh264enc");
+        assert_eq!(EncoderKind::Vaapi.gst_element(), "vah264enc");
+        assert!(EncoderKind::Vaapi
+            .gst_candidates()
+            .contains(&"vaapih264enc"));
+        assert!(EncoderKind::Nvenc.gst_candidates().contains(&"nvh264enc"));
+    }
+
+    #[test]
+    fn default_params_target_full_hd() {
+        let params = EncodeParams::default();
+        assert_eq!(params.width, 1920);
+        assert_eq!(params.height, 1080);
+        assert_eq!(params.framerate, 60);
+        assert_eq!(params.kind, EncoderKind::Auto);
+    }
+
+    #[test]
+    fn init_is_idempotent() {
+        init().unwrap();
+        init().unwrap();
+    }
+
+    #[test]
+    fn detect_available_returns_a_known_kind() {
+        init().unwrap();
+        let (kind, element) = detect_available(EncoderKind::X264);
+        assert!(matches!(
+            kind,
+            EncoderKind::X264 | EncoderKind::Vaapi | EncoderKind::Nvenc,
+        ));
+        assert!(!element.is_empty());
+    }
+
+    #[test]
+    fn auto_prefers_hardware_when_va_or_nvenc_is_registered() {
+        init().unwrap();
+        let (kind, element) = detect_available(EncoderKind::Auto);
+        if element_available("vah264enc")
+            || element_available("vaapih264enc")
+            || element_available("nvh264enc")
+        {
+            assert_ne!(kind, EncoderKind::X264, "auto selected software {element}");
+            assert_ne!(element, "x264enc");
+        }
+    }
+
+    #[test]
+    fn frame_duration_ns_matches_framerate() {
+        assert_eq!(Encoder::frame_duration_ns(60), 16_666_666);
+        assert_eq!(Encoder::frame_duration_ns(30), 33_333_333);
+    }
+
+    #[test]
+    fn intra_refresh_exists_only_on_x264() {
+        init().unwrap();
+        let Ok(x264) = make_element("x264enc") else {
+            return;
+        };
+        assert!(
+            x264.find_property("intra-refresh").is_some(),
+            "x264enc must expose intra-refresh for 1-3 datagram healing"
+        );
+        if element_available("vah264enc") {
+            let va = make_element("vah264enc").unwrap();
+            assert!(
+                va.find_property("intra-refresh").is_none(),
+                "vah264enc unexpectedly grew intra-refresh; update FEC docs"
+            );
+        }
+    }
+
+    #[test]
+    fn infinite_gop_uses_property_maximum() {
+        init().unwrap();
+        let encoder = match make_element("x264enc") {
+            Ok(enc) => enc,
+            Err(_) => return,
+        };
+        configure_gop(&encoder, true);
+        assert!(encoder.property::<bool>("intra-refresh"));
+        assert!(encoder.property::<u32>("key-int-max") > 60);
+    }
+
+    #[test]
+    fn default_gop_leaves_intra_refresh_off() {
+        init().unwrap();
+        let encoder = match make_element("x264enc") {
+            Ok(enc) => enc,
+            Err(_) => return,
+        };
+        configure_gop(&encoder, false);
+        assert!(
+            !encoder.property::<bool>("intra-refresh"),
+            "intra-refresh must stay off by default: with it on, x264enc emits no IDR after the first frame and force-key-unit only marks a P-frame, so clients can never recover from a lost keyframe"
+        );
+        assert!(encoder.property::<u32>("key-int-max") <= 120);
+    }
+
+    fn try_live_encoder(kind: EncoderKind) -> Option<Encoder> {
+        match Encoder::new(EncodeParams {
+            kind,
+            bitrate_kbps: 8000,
+            width: 64,
+            height: 64,
+            framerate: 60,
+            gop_on_demand: false,
+        }) {
+            Ok(enc) => Some(enc),
+            Err(e) => {
+                eprintln!("Skipping: no H.264 encoder available: {e}");
+                None
+            }
+        }
+    }
+
+    fn assert_live_one_frame_vbv(enc: &Encoder) {
+        let want_ms = one_frame_vbv_ms(60);
+        let want_kb = one_frame_vbv_kb(8000, 60, 64, 64);
+        if enc.encoder.find_property("vbv-buf-capacity").is_some() {
+            let got = enc.encoder.property::<u32>("vbv-buf-capacity");
+            assert_ne!(
+                got, 600,
+                "Encoder::new left x264enc on the 600 ms default VBV"
+            );
+            assert_eq!(got, want_ms);
+        }
+        if enc.encoder.find_property("cpb-size").is_some() {
+            let got = enc.encoder.property::<u32>("cpb-size");
+            assert_ne!(got, 0, "Encoder::new left vah264enc cpb-size at auto (0)");
+
+            if got != want_kb {
+                assert!(
+                    got >= want_kb,
+                    "vah264enc cpb-size {got} is below the one-frame window {want_kb}"
+                );
+            }
+        }
+        if enc.encoder.find_property("vbv-buffer-size").is_some() {
+            let got = enc.encoder.property::<u32>("vbv-buffer-size");
+            assert_ne!(
+                got, 0,
+                "Encoder::new left nvh264enc vbv-buffer-size at NVENC default (0)"
+            );
+            assert_eq!(got, want_kb);
+        }
+    }
+
+    #[test]
+    fn suggested_bitrate_scales_with_resolution_and_fps() {
+        assert_eq!(suggested_bitrate_kbps(1920, 1080, 60), 9953);
+        assert_eq!(suggested_bitrate_kbps(2560, 1600, 90), 29491);
+        assert_eq!(suggested_bitrate_kbps(1280, 720, 30), 8000);
+        assert_eq!(suggested_bitrate_kbps(3840, 2160, 60), 39813);
+    }
+
+    #[test]
+    fn one_frame_vbv_is_bitrate_over_fps() {
+        assert_eq!(one_frame_vbv_ms(60), 17);
+        assert_eq!(one_frame_vbv_ms(30), 34);
+        assert_eq!(one_frame_vbv_ms(1), 1000);
+        assert_eq!(one_frame_vbv_ms(0), 1000);
+        assert_eq!(one_frame_vbv_kb(8000, 60, 320, 240), 400);
+        assert_eq!(one_frame_vbv_kb(8000, 30, 320, 240), 400);
+        assert_eq!(one_frame_vbv_kb(1000, 60, 64, 64), 200);
+    }
+
+    #[test]
+    fn one_frame_vbv_covers_a_keyframe_at_high_resolution() {
+        let vbv_kb = one_frame_vbv_kb(20_000, 90, 2560, 1600);
+        assert_eq!(vbv_kb, 1_000);
+        assert!(vbv_kb > 20_000 / 90, "must exceed the bitrate/fps value");
+        for (bitrate, fps, w, h) in [
+            (20_000_u32, 90_u32, 2560_u32, 1600_u32),
+            (50_000, 90, 3840, 2160),
+        ] {
+            let kb = one_frame_vbv_kb(bitrate, fps, w, h);
+            let buffered_ms = u64::from(kb) * 1000 / u64::from(bitrate);
+            assert!(
+                buffered_ms <= u64::from(MAX_VBV_LATENCY_MS) + 1,
+                "{w}x{h} at {bitrate} kbps buffered {buffered_ms} ms"
+            );
+        }
+    }
+
+    #[test]
+    fn configure_one_frame_vbv_writes_cpb_before_playing() {
+        init().unwrap();
+        let Ok(enc) = make_element("vah264enc") else {
+            return;
+        };
+        configure_one_frame_vbv(&enc, 8000, 60, 1920, 1080);
+        assert_eq!(
+            enc.property::<u32>("cpb-size"),
+            one_frame_vbv_kb(8000, 60, 1920, 1080)
+        );
+    }
+
+    #[test]
+    fn x264_encoder_new_caps_vbv_at_one_frame() {
+        init().unwrap();
+        let Some(enc) = try_live_encoder(EncoderKind::X264) else {
+            return;
+        };
+        assert_eq!(enc.kind(), EncoderKind::X264);
+        assert_live_one_frame_vbv(&enc);
+        enc.stop();
+    }
+
+    #[test]
+    fn vaapi_encoder_new_caps_cpb_at_one_frame() {
+        init().unwrap();
+        if !element_available("vah264enc") && !element_available("vaapih264enc") {
+            return;
+        }
+        let Some(enc) = try_live_encoder(EncoderKind::Vaapi) else {
+            return;
+        };
+        assert_eq!(enc.kind(), EncoderKind::Vaapi);
+        assert_live_one_frame_vbv(&enc);
+        enc.stop();
+    }
+
+    #[test]
+    fn auto_encoder_new_caps_vbv_at_one_frame() {
+        init().unwrap();
+        let Some(enc) = try_live_encoder(EncoderKind::Auto) else {
+            return;
+        };
+        assert_live_one_frame_vbv(&enc);
+        enc.stop();
+    }
+
+    #[test]
+    fn request_keyframe_is_safe_before_playing() {
+        init().unwrap();
+        let encoder = Encoder::new(EncodeParams {
+            kind: EncoderKind::X264,
+            bitrate_kbps: 1000,
+            width: 64,
+            height: 64,
+            framerate: 30,
+            gop_on_demand: false,
+        });
+        if let Ok(encoder) = encoder {
+            encoder.request_keyframe();
+            encoder.stop();
+        }
+    }
+
+    fn nal_types(au: &[u8]) -> Vec<u8> {
+        let mut types = Vec::new();
+        let mut i = 0;
+        while i + 3 < au.len() {
+            let sc = if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+                Some(3)
+            } else if i + 4 < au.len()
+                && au[i] == 0
+                && au[i + 1] == 0
+                && au[i + 2] == 0
+                && au[i + 3] == 1
+            {
+                Some(4)
+            } else {
+                None
+            };
+            if let Some(n) = sc {
+                if i + n < au.len() {
+                    types.push(au[i + n] & 0x1f);
+                }
+                i += n;
+            } else {
+                i += 1;
+            }
+        }
+        types
+    }
+
+    #[test]
+    fn forced_keyframe_is_a_real_idr() {
+        init().unwrap();
+        let mut encoder = match Encoder::new(EncodeParams {
+            kind: EncoderKind::X264,
+            bitrate_kbps: 16000,
+            width: 640,
+            height: 360,
+            framerate: 60,
+            gop_on_demand: false,
+        }) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        assert!(
+            !encoder.encoder.property::<bool>("intra-refresh"),
+            "intra-refresh must be off by default so force-key-unit yields a real IDR"
+        );
+        let mut rx = encoder.subscribe().unwrap();
+        let frame = vec![40u8; 640 * 360 * 4];
+        let mut forced_ids = Vec::new();
+        let mut idx = 0u64;
+        let mut forced = false;
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(1500) {
+            if idx == 30 && !forced {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                encoder.request_keyframe();
+                forced = true;
+            }
+            let _ = encoder.push_frame(&frame, 640, 360, idx * 16_666_666);
+            idx += 1;
+            while let Ok(chunk) = rx.try_recv() {
+                if chunk.is_keyframe {
+                    forced_ids.push((idx, nal_types(&chunk.bytes).contains(&5)));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+        assert!(
+            forced_ids.len() >= 2,
+            "expected an opening IDR and a forced one, got {forced_ids:?}"
+        );
+        for (at, has_idr) in &forced_ids {
+            assert!(
+                *has_idr,
+                "keyframe flagged at frame {at} carries no IDR NAL (type 5): clients cannot \
+                 decode it, which leaves the tablet black and stuck requesting IDRs"
+            );
+        }
+        encoder.stop();
+    }
+
+    #[test]
+    fn encodes_frame_and_emits_keyframe() {
+        init().unwrap();
+        let mut encoder = match Encoder::new(EncodeParams {
+            kind: EncoderKind::X264,
+            bitrate_kbps: 1000,
+            width: 64,
+            height: 64,
+            framerate: 30,
+            gop_on_demand: false,
+        }) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let mut rx = encoder.subscribe().unwrap();
+        let dummy_frame = vec![128u8; 64 * 64 * 4];
+        for i in 0..10 {
+            let pts = i * 33_333_333;
+            if i == 4 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                encoder.request_keyframe();
+            }
+            if encoder.push_frame(&dummy_frame, 64, 64, pts).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut received = 0;
+        let mut keyframes = 0;
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(1000) {
+            if let Ok(chunk) = rx.try_recv() {
+                received += 1;
+                if chunk.is_keyframe {
+                    keyframes += 1;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(received > 0);
+        assert!(keyframes > 0);
+    }
+}

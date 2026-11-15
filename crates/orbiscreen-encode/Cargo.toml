@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────
+# Orbiscreen - orbiscreen-encode Crate Manifest 
+# ─────────────────────────────────────────────
+
+[package]
+name = "orbiscreen-encode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "GStreamer-based encoding pipeline (VAAPI / NVENC / x264)"
+
+[lints]
+workspace = true
+
+[dependencies]
+orbiscreen-core = { path = "../orbiscreen-core" }
+gstreamer = { workspace = true }
+gstreamer-app = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }

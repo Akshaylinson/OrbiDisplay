@@ -1,0 +1,1306 @@
+
+package com.orbiscreen.android.ui.stream
+
+import android.app.Activity
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateIntOffsetAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.material.icons.rounded.BatteryFull
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ExitToApp
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.FitScreen
+import androidx.compose.material.icons.rounded.Keyboard
+import androidx.compose.material.icons.rounded.Menu
+import androidx.compose.material.icons.rounded.Mouse
+import androidx.compose.material.icons.rounded.PhoneAndroid
+import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Speed
+import androidx.compose.material.icons.rounded.TouchApp
+import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material.icons.rounded.WifiOff
+import androidx.compose.material.icons.rounded.ZoomOutMap
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ElevatedCard
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
+import android.content.res.Configuration
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import android.content.Context
+import android.content.ContextWrapper
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import kotlinx.coroutines.delay
+import com.orbiscreen.android.R
+import com.orbiscreen.android.player.StreamEvent
+import com.orbiscreen.android.ui.theme.GlassBorderDark
+import com.orbiscreen.android.ui.theme.GlassDark
+import kotlin.math.roundToInt
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
+enum class ScreenCorner { TopLeft, TopRight, BottomLeft, BottomRight }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun StreamScreen(
+    viewModel: StreamViewModel,
+    onBack: () -> Unit,
+) {
+    val state by viewModel.state.collectAsState()
+    val login by viewModel.login.collectAsState()
+    if (login.stage != LoginStage.Ready) {
+        LanLoginScreen(viewModel, login, onBack)
+        return
+    }
+    val player = viewModel.player.collectAsState().value
+    val udp = viewModel.udpPlayer.collectAsState().value
+    val usb = viewModel.usbPlayer.collectAsState().value
+    val videoTransport = StreamTransport.label(
+        udp = udp != null,
+        usbAoa = usb?.usesAoa == true,
+        usbHttp = usb != null && usb.usesAoa != true,
+        exo = player != null,
+        lanHttp = usb?.overLan == true,
+    )
+    val surfacePlayer = udp ?: usb
+    var showControls by remember { mutableStateOf(false) }
+    var showSettingsSheet by remember { mutableStateOf(false) }
+    var showExitConfirmDialog by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val view = LocalView.current
+    val prefs = remember { com.orbiscreen.android.data.PrefsStore(context) }
+    var isTouchMode by remember { mutableStateOf(prefs.touchMode) }
+    var showStats by remember { mutableStateOf(prefs.showStats) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    BackHandler {
+        showExitConfirmDialog = true
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> viewModel.onPause()
+                Lifecycle.Event.ON_RESUME -> viewModel.onResume()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        val window = context.findActivity()?.window
+        if (window != null) {
+            val controller = WindowCompat.getInsetsController(window, window.decorView)
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+        }
+        onDispose {
+            val w = context.findActivity()?.window
+            if (w != null) {
+                WindowCompat.getInsetsController(w, w.decorView)
+                    .show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
+
+    DisposableEffect(prefs.keepScreenAwake) {
+        view.keepScreenOn = prefs.keepScreenAwake
+        val window = context.findActivity()?.window
+        if (prefs.keepScreenAwake) {
+            window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            view.keepScreenOn = false
+            window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    val configuration = LocalConfiguration.current
+    var lastOrientation by remember { mutableIntStateOf(configuration.orientation) }
+    LaunchedEffect(configuration.orientation) {
+        if (lastOrientation != configuration.orientation) {
+            lastOrientation = configuration.orientation
+            val curW = state.displayWidth
+            val curH = state.displayHeight
+            val isScreenPortrait = configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+            val isStreamPortrait = curW < curH
+            if (isScreenPortrait != isStreamPortrait && curW > 0 && curH > 0) {
+                viewModel.updateDimensions(curH, curW, "${curH}×${curW}")
+            }
+        }
+    }
+
+    LaunchedEffect(state.event) {
+        if (state.event is StreamEvent.Disconnected) {
+            val reason = (state.event as StreamEvent.Disconnected).reason
+            if (reason.isNotBlank()) {
+                android.widget.Toast.makeText(context, reason, android.widget.Toast.LENGTH_SHORT).show()
+            }
+            delay(1200)
+            onBack()
+        }
+    }
+
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black),
+    ) {
+        val density = LocalDensity.current
+        val widthPx = with(density) { maxWidth.toPx() }
+        val heightPx = with(density) { maxHeight.toPx() }
+        val marginPx = with(density) { 16.dp.toPx() }
+        val fabSizePx = with(density) { 46.dp.toPx() }
+
+        var corner by remember { mutableStateOf(ScreenCorner.TopRight) }
+        var dragOffset by remember { mutableStateOf(Offset.Zero) }
+        var isDragging by remember { mutableStateOf(false) }
+
+        val targetCornerOffset = when (corner) {
+            ScreenCorner.TopLeft -> IntOffset(marginPx.roundToInt(), marginPx.roundToInt())
+            ScreenCorner.TopRight -> IntOffset((widthPx - fabSizePx - marginPx).roundToInt(), marginPx.roundToInt())
+            ScreenCorner.BottomLeft -> IntOffset(marginPx.roundToInt(), (heightPx - fabSizePx - marginPx).roundToInt())
+            ScreenCorner.BottomRight -> IntOffset((widthPx - fabSizePx - marginPx).roundToInt(), (heightPx - fabSizePx - marginPx).roundToInt())
+        }
+
+        val animatedOffset by animateIntOffsetAsState(
+            targetValue = if (isDragging) {
+                IntOffset(
+                    (targetCornerOffset.x + dragOffset.x).roundToInt().coerceIn(0, (widthPx - fabSizePx).roundToInt()),
+                    (targetCornerOffset.y + dragOffset.y).roundToInt().coerceIn(0, (heightPx - fabSizePx).roundToInt()),
+                )
+            } else targetCornerOffset,
+            animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+            label = "cornerFab",
+        )
+
+        val udpLat = udp?.latencyMs?.collectAsState()?.value
+        val usbLat = usb?.latencyMs?.collectAsState()?.value
+        LaunchedEffect(udpLat, usbLat) {
+            val ms = udpLat ?: usbLat ?: return@LaunchedEffect
+            if (ms >= 0) viewModel.streamStats.noteDelay(ms)
+        }
+        var frameDelayMs by remember { mutableStateOf<Int?>(null) }
+        LaunchedEffect(Unit) {
+            while (true) {
+                frameDelayMs = viewModel.streamStats.snapshot().ageMs
+                delay(100)
+            }
+        }
+        if ((player != null || surfacePlayer != null) && state.event !is StreamEvent.Disconnected) {
+            val inputGeneration by viewModel.inputGeneration.collectAsState()
+            val input = remember(inputGeneration) { viewModel.ensureInput() }
+            PlayerSurface(
+                player = player,
+                udp = surfacePlayer,
+                isTouchMode = isTouchMode,
+                streamWidth = state.displayWidth,
+                streamHeight = state.displayHeight,
+                onPointer = { x, y, w, h, btn, pressed ->
+                    input.pointerAction(x, y, w, h, btn, pressed)
+                },
+                onTouch = { slot, id, x, y, w, h, pressed, coalesce ->
+                    input.touch(slot, id, x, y, w, h, pressed, coalesce)
+                },
+                onDeltaMove = { dx, dy -> input.moveDelta(dx, dy) },
+                onLeftClick = { input.leftClick() },
+                onRightClick = { input.rightClick() },
+                onScroll = { dy -> input.wheel(dy) },
+                onStylus = { x, y, w, h, pressure, tiltX, tiltY ->
+                    input.stylus(x, y, w, h, pressure, tiltX, tiltY)
+                },
+                scaleMode = state.scaleMode,
+            )
+        }
+        if (state.event !is StreamEvent.Playing && state.event !is StreamEvent.Buffering) {
+            StatusOverlay(
+                event = state.event,
+                onRetry = { viewModel.retry() },
+                onBack = onBack,
+            )
+        }
+
+        AnimatedVisibility(
+            visible = showControls,
+            enter = fadeIn() + slideInVertically { -it },
+            exit = fadeOut() + slideOutVertically { -it },
+            modifier = Modifier.align(Alignment.TopCenter),
+        ) {
+            ControlToolbar(
+                hostLabel = StreamTransport.hostLabel(videoTransport, state.host),
+                resolution = "${state.displayWidth}×${state.displayHeight}",
+                delayMs = frameDelayMs,
+                isTouchMode = isTouchMode,
+                statsVisible = showStats,
+                onToggleInputMode = {
+                    isTouchMode = !isTouchMode
+                    prefs.touchMode = isTouchMode
+                },
+                onToggleKeyboard = viewModel::toggleKeyboard,
+                onOpenSettings = { showSettingsSheet = true },
+                onToggleStats = {
+                    showStats = !showStats
+                    prefs.showStats = showStats
+                },
+                onLock = viewModel::lock,
+                notice = state.notice,
+                onDismissNotice = viewModel::dismissNotice,
+                onHideControls = {
+                    showControls = false
+                },
+                onDisconnect = { showExitConfirmDialog = true },
+            )
+        }
+
+        AnimatedVisibility(
+            visible = !showControls,
+            enter = fadeIn(),
+            exit = fadeOut(),
+        ) {
+            Box(
+                modifier = Modifier
+                    .offset { animatedOffset }
+                    .pointerInput(Unit) {
+                        detectDragGestures(
+                            onDragStart = {
+                                isDragging = true
+                                dragOffset = Offset.Zero
+                            },
+                            onDrag = { change, dragAmount ->
+                                change.consume()
+                                dragOffset += dragAmount
+                            },
+                            onDragEnd = {
+                                val currentCenterX = targetCornerOffset.x + dragOffset.x + fabSizePx / 2
+                                val currentCenterY = targetCornerOffset.y + dragOffset.y + fabSizePx / 2
+                                val isLeft = currentCenterX < widthPx / 2
+                                val isTop = currentCenterY < heightPx / 2
+                                corner = when {
+                                    isLeft && isTop -> ScreenCorner.TopLeft
+                                    !isLeft && isTop -> ScreenCorner.TopRight
+                                    isLeft && !isTop -> ScreenCorner.BottomLeft
+                                    else -> ScreenCorner.BottomRight
+                                }
+                                dragOffset = Offset.Zero
+                                isDragging = false
+                            },
+                            onDragCancel = {
+                                dragOffset = Offset.Zero
+                                isDragging = false
+                            },
+                        )
+                    },
+            ) {
+                Surface(
+                    onClick = {
+                        if (!isDragging && dragOffset.getDistance() < 8f) {
+                            showControls = true
+                        }
+                    },
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
+                    border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)),
+                    shadowElevation = 6.dp,
+                    modifier = Modifier.size(46.dp),
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Rounded.Menu,
+                            contentDescription = "Menu",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(22.dp),
+                        )
+                    }
+                }
+            }
+        }
+
+        AnimatedVisibility(
+            visible = showStats && (player != null || surfacePlayer != null),
+            enter = fadeIn(),
+            exit = fadeOut(),
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(start = 16.dp, bottom = 16.dp),
+        ) {
+            StatsOverlay(stats = viewModel.streamStats, transport = videoTransport)
+        }
+
+        AnimatedVisibility(
+            visible = state.keyboardVisible,
+            enter = fadeIn(),
+            exit = fadeOut(),
+        ) {
+            KeyboardOverlay(
+                onKey = { code, pressed ->
+                    viewModel.ensureInput().key(code, pressed)
+                },
+                onClose = { viewModel.toggleKeyboard() },
+            )
+        }
+
+        if (showSettingsSheet) {
+            ConnectionSettingsSheet(
+                currentWidth = state.displayWidth,
+                currentHeight = state.displayHeight,
+                currentPointerSpeed = viewModel.pointerSpeed,
+                onApplyDimensions = { w, h, label ->
+                    viewModel.updateDimensions(w, h, label)
+                    showSettingsSheet = false
+                },
+                onSetResolutionPreset = { preset, w, h ->
+                    viewModel.setResolutionPreset(preset, w, h)
+                    showSettingsSheet = false
+                },
+                onScaleModeChange = { modeKey ->
+                    viewModel.setScaleModeByKey(modeKey)
+                },
+                onPointerSpeedChange = { speed ->
+                    viewModel.setPointerSpeed(speed)
+                },
+                onDismiss = { showSettingsSheet = false },
+            )
+        }
+
+        if (showExitConfirmDialog) {
+            androidx.compose.ui.window.Dialog(
+                onDismissRequest = { showExitConfirmDialog = false },
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = MaterialTheme.colorScheme.surface,
+                    shadowElevation = 16.dp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp),
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(22.dp),
+                    ) {
+                        Surface(
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.error.copy(alpha = 0.15f),
+                            modifier = Modifier.size(52.dp),
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    Icons.AutoMirrored.Rounded.ExitToApp,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.size(26.dp),
+                                )
+                            }
+                        }
+
+                        Spacer(Modifier.height(14.dp))
+
+                        Text(
+                            text = stringResource(R.string.disconnect_confirm_title),
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                        )
+
+                        Spacer(Modifier.height(6.dp))
+
+                        Text(
+                            text = stringResource(R.string.disconnect_confirm_message),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            lineHeight = 18.sp,
+                        )
+
+                        Spacer(Modifier.height(20.dp))
+
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            FilledTonalButton(
+                                onClick = { showExitConfirmDialog = false },
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.weight(1f).height(42.dp),
+                            ) {
+                                Text(stringResource(R.string.cancel), fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                            }
+
+                            Button(
+                                onClick = {
+                                    showExitConfirmDialog = false
+                                    viewModel.disconnect()
+                                    onBack()
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.error,
+                                ),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.weight(1f).height(42.dp),
+                            ) {
+                                Text(stringResource(R.string.disconnect_confirm_action), fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ConnectionSettingsSheet(
+    currentWidth: Int,
+    currentHeight: Int,
+    currentPointerSpeed: Float,
+    onApplyDimensions: (Int, Int, String) -> Unit,
+    onSetResolutionPreset: (String, Int, Int) -> Unit,
+    onScaleModeChange: (String) -> Unit,
+    onPointerSpeedChange: (Float) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val context = LocalContext.current
+    val prefs = remember { com.orbiscreen.android.data.PrefsStore(context) }
+
+    var pointerSpeedState by remember { mutableFloatStateOf(currentPointerSpeed) }
+    var scaleMode by remember { mutableStateOf(prefs.scaleMode) }
+    var keepAwake by remember { mutableStateOf(prefs.keepScreenAwake) }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = MaterialTheme.colorScheme.surface,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+        dragHandle = {
+            Box(
+                modifier = Modifier
+                    .padding(top = 10.dp, bottom = 4.dp)
+                    .size(width = 38.dp, height = 4.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f))
+            )
+        },
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 18.dp, vertical = 8.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.primaryContainer,
+                    modifier = Modifier.size(36.dp),
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Rounded.Settings,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                }
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    text = stringResource(R.string.display_settings_title),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f),
+                )
+                IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        Icons.Rounded.Close,
+                        contentDescription = stringResource(R.string.cancel),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+
+            var resolutionPreset by remember { mutableStateOf(prefs.resolutionPreset) }
+            var customW by remember { mutableStateOf("") }
+            var customH by remember { mutableStateOf("") }
+
+            ElevatedCard(
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        text = stringResource(R.string.resolution_title),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    
+                    val resChip: @Composable (String, String, Int, Int) -> Unit = { label, key, w, h ->
+                        val isSel = resolutionPreset == key
+                        Surface(
+                            onClick = {
+                                resolutionPreset = key
+                                onSetResolutionPreset(key, w, h)
+                            },
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (isSel) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                            border = if (isSel) BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null,
+                            modifier = Modifier.weight(1f).height(32.dp),
+                        ) {
+                            Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxWidth()) {
+                                Text(
+                                    text = label,
+                                    fontSize = 11.sp,
+                                    fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (isSel) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
+                    }
+
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        resChip(stringResource(R.string.resolution_native), "native", 0, 0)
+                        resChip("720p", "720p", 1280, 720)
+                        resChip("1080p", "1080p", 1920, 1080)
+                        resChip("1440p", "1440p", 2560, 1440)
+                        resChip("2K", "2k", 2560, 1600)
+                    }
+
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        BasicTextField(
+                            value = customW,
+                            onValueChange = { customW = it },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.weight(1f).height(36.dp).background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp)).padding(horizontal = 8.dp, vertical = 8.dp),
+                            decorationBox = { innerTextField ->
+                                if (customW.isEmpty()) Text("Width", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f))
+                                innerTextField()
+                            }
+                        )
+                        Text("x", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        BasicTextField(
+                            value = customH,
+                            onValueChange = { customH = it },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.weight(1f).height(36.dp).background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp)).padding(horizontal = 8.dp, vertical = 8.dp),
+                            decorationBox = { innerTextField ->
+                                if (customH.isEmpty()) Text("Height", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f))
+                                innerTextField()
+                            }
+                        )
+                        Button(
+                            onClick = {
+                                val w = customW.toIntOrNull() ?: 0
+                                val h = customH.toIntOrNull() ?: 0
+                                if (w > 0 && h > 0) {
+                                    val key = "custom_${w}x${h}"
+                                    resolutionPreset = key
+                                    onSetResolutionPreset(key, w, h)
+                                }
+                            },
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.height(36.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp)
+                        ) {
+                            Text(stringResource(R.string.res_apply), fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+
+            ElevatedCard(
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text(
+                        text = stringResource(R.string.scale_mode_title),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        val modes = listOf("fit" to R.string.scale_fit, "fill" to R.string.scale_fill)
+                        modes.forEach { (key, labelRes) ->
+                            val isSel = scaleMode == key
+                            Surface(
+                                onClick = {
+                                    scaleMode = key
+                                    prefs.scaleMode = key
+                                    onScaleModeChange(key)
+                                },
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (isSel) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                                border = if (isSel) BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary) else null,
+                                modifier = Modifier.weight(1f).height(40.dp),
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Text(
+                                        text = stringResource(labelRes),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium,
+                                        color = if (isSel) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            ElevatedCard(
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Rounded.Speed, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text(text = stringResource(R.string.pointer_speed_title), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                            }
+                            Text(text = "%.1fx".format(pointerSpeedState), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                        }
+                        Slider(
+                            value = pointerSpeedState,
+                            onValueChange = {
+                                pointerSpeedState = it
+                                onPointerSpeedChange(it)
+                            },
+                            valueRange = 0.4f..2.2f,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            val presets = listOf(0.7f to R.string.pointer_speed_slow, 1.0f to R.string.pointer_speed_normal, 1.4f to R.string.pointer_speed_fast)
+                            presets.forEach { (spd, labelRes) ->
+                                val isSel = kotlin.math.abs(pointerSpeedState - spd) < 0.08f
+                                Surface(
+                                    onClick = { pointerSpeedState = spd; onPointerSpeedChange(spd) },
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (isSel) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                                    border = if (isSel) BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null,
+                                    modifier = Modifier.weight(1f).height(32.dp),
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Text(
+                                            text = stringResource(labelRes),
+                                            fontSize = 11.sp,
+                                            fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium,
+                                            color = if (isSel) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                keepAwake = !keepAwake
+                                prefs.keepScreenAwake = keepAwake
+                            }
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (keepAwake) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                            modifier = Modifier.size(36.dp),
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    Icons.Rounded.BatteryFull,
+                                    contentDescription = null,
+                                    tint = if (keepAwake) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                            }
+                        }
+                        Spacer(Modifier.width(14.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(text = stringResource(R.string.keep_screen_awake), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                            Text(text = stringResource(R.string.keep_screen_awake_desc), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        Switch(checked = keepAwake, onCheckedChange = { keepAwake = it; prefs.keepScreenAwake = it })
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+        }
+    }
+}
+
+@Composable
+private fun StatusOverlay(
+    event: StreamEvent,
+    onRetry: () -> Unit,
+    onBack: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF11111B)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            modifier = Modifier
+                .padding(horizontal = 32.dp)
+                .fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            when (event) {
+                is StreamEvent.Idle, is StreamEvent.Connecting -> {
+                    CircularProgressIndicator(
+                        strokeWidth = 3.dp,
+                        modifier = Modifier.size(48.dp),
+                        color = MaterialTheme.colorScheme.primary,
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        stringResource(R.string.connecting),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onBackground,
+                    )
+                    if (event is StreamEvent.Connecting) {
+                        Text(
+                            event.uri.toString(),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        )
+                    }
+                }
+                is StreamEvent.Buffering -> {
+                    CircularProgressIndicator(
+                        strokeWidth = 3.dp,
+                        modifier = Modifier.size(48.dp),
+                        color = MaterialTheme.colorScheme.primary,
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        stringResource(R.string.buffering),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onBackground,
+                    )
+                }
+                is StreamEvent.Error -> {
+                    Box(
+                        modifier = Modifier
+                            .size(64.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.22f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Rounded.WifiOff,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(32.dp),
+                        )
+                    }
+                    Text(
+                        stringResource(R.string.error_stream),
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
+                    Text(
+                        event.message,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Button(
+                        onClick = onRetry,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primary,
+                        ),
+                    ) {
+                        Icon(
+                            Icons.Rounded.Refresh,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            stringResource(R.string.retry),
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                    FilledTonalButton(
+                        onClick = onBack,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Text(stringResource(R.string.back))
+                    }
+                }
+                is StreamEvent.Disconnected -> {
+                    Box(
+                        modifier = Modifier
+                            .size(64.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.22f)),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            Icons.Rounded.WifiOff,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(32.dp),
+                        )
+                    }
+                    Text(
+                        stringResource(R.string.disconnected),
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
+                    Text(
+                        event.reason,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Button(
+                        onClick = onRetry,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primary,
+                        ),
+                    ) {
+                        Icon(
+                            Icons.Rounded.Refresh,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            stringResource(R.string.retry),
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                    FilledTonalButton(
+                        onClick = onBack,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                    ) {
+                        Text(stringResource(R.string.back))
+                    }
+                }
+                is StreamEvent.Playing -> Unit
+            }
+        }
+    }
+}
+
+@Composable
+private fun KeyboardOverlay(onKey: (Int, Boolean) -> Unit, onClose: () -> Unit) {
+    val dummyPrefill = "   "
+    var dummyText by remember { mutableStateOf(TextFieldValue(dummyPrefill, TextRange(dummyPrefill.length))) }
+    val focusRequester = remember { FocusRequester() }
+
+    var isCtrlLatched by remember { mutableStateOf(false) }
+    var isAltLatched by remember { mutableStateOf(false) }
+    var isShiftLatched by remember { mutableStateOf(false) }
+    var isSuperLatched by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+    }
+
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.BottomCenter,
+    ) {
+        BasicTextField(
+            value = dummyText,
+            onValueChange = { newVal ->
+                if (newVal.text.length < dummyText.text.length || newVal.text.isEmpty()) {
+                    val count = (dummyText.text.length - newVal.text.length).coerceAtLeast(1)
+                    for (i in 0 until count) {
+                        onKey(14, true)
+                        onKey(14, false)
+                    }
+                    dummyText = TextFieldValue(dummyPrefill, TextRange(dummyPrefill.length))
+                } else if (newVal.text.length > dummyText.text.length) {
+                    val typed = newVal.text.substring(dummyText.text.length)
+                    for (ch in typed) {
+                        sendChar(ch, onKey)
+                    }
+                    if (isCtrlLatched) { onKey(29, false); isCtrlLatched = false }
+                    if (isAltLatched) { onKey(56, false); isAltLatched = false }
+                    if (isShiftLatched) { onKey(42, false); isShiftLatched = false }
+                    if (isSuperLatched) { onKey(125, false); isSuperLatched = false }
+                    dummyText = TextFieldValue(dummyPrefill, TextRange(dummyPrefill.length))
+                }
+            },
+            modifier = Modifier
+                .size(1.dp)
+                .alpha(0.01f)
+                .focusRequester(focusRequester),
+            keyboardOptions = KeyboardOptions(
+                imeAction = ImeAction.None,
+                autoCorrectEnabled = false,
+            ),
+        )
+
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .imePadding(),
+            shape = RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp),
+            color = Color(0xF8161624),
+            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.08f)),
+            shadowElevation = 14.dp,
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 7.dp),
+                verticalArrangement = Arrangement.spacedBy(5.dp),
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    KeyboardPill("Esc", Modifier.weight(0.95f)) { onKey(1, true); onKey(1, false) }
+                    KeyboardPill("Tab", Modifier.weight(0.95f)) { onKey(15, true); onKey(15, false) }
+                    KeyboardPill("F1", Modifier.weight(0.85f)) { onKey(59, true); onKey(59, false) }
+                    KeyboardPill("F2", Modifier.weight(0.85f)) { onKey(60, true); onKey(60, false) }
+                    KeyboardPill("F5", Modifier.weight(0.85f)) { onKey(63, true); onKey(63, false) }
+                    KeyboardPill("F11", Modifier.weight(0.95f)) { onKey(87, true); onKey(87, false) }
+                    KeyboardPill("F12", Modifier.weight(0.95f)) { onKey(88, true); onKey(88, false) }
+                    KeyboardPill(
+                        label = "⌫",
+                        modifier = Modifier.weight(1.15f),
+                        customColor = Color(0xFF32202A),
+                        customBorder = Color(0xFFFF5555).copy(alpha = 0.35f),
+                        textColor = Color(0xFFFF8888),
+                    ) {
+                        onKey(14, true)
+                        onKey(14, false)
+                    }
+                    IconButton(
+                        onClick = onClose,
+                        modifier = Modifier.size(34.dp),
+                    ) {
+                        Icon(
+                            Icons.Rounded.Close,
+                            contentDescription = stringResource(R.string.close_keyboard),
+                            tint = Color.White.copy(alpha = 0.75f),
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    KeyboardTogglePill("Ctrl", isCtrlLatched, Modifier.weight(1.05f)) {
+                        isCtrlLatched = !isCtrlLatched
+                        onKey(29, isCtrlLatched)
+                    }
+                    KeyboardTogglePill("Alt", isAltLatched, Modifier.weight(0.95f)) {
+                        isAltLatched = !isAltLatched
+                        onKey(56, isAltLatched)
+                    }
+                    KeyboardTogglePill("Shift", isShiftLatched, Modifier.weight(1.05f)) {
+                        isShiftLatched = !isShiftLatched
+                        onKey(42, isShiftLatched)
+                    }
+                    KeyboardTogglePill("Win", isSuperLatched, Modifier.weight(0.95f)) {
+                        isSuperLatched = !isSuperLatched
+                        onKey(125, isSuperLatched)
+                    }
+                    KeyboardPill(stringResource(R.string.key_undo), Modifier.weight(1.0f)) {
+                        onKey(29, true); onKey(44, true); onKey(44, false); onKey(29, false)
+                    }
+                    KeyboardPill(stringResource(R.string.key_copy), Modifier.weight(1.0f)) {
+                        onKey(29, true); onKey(46, true); onKey(46, false); onKey(29, false)
+                    }
+                    KeyboardPill(stringResource(R.string.key_paste), Modifier.weight(1.0f)) {
+                        onKey(29, true); onKey(47, true); onKey(47, false); onKey(29, false)
+                    }
+                    KeyboardPill("Del", Modifier.weight(0.95f)) { onKey(111, true); onKey(111, false) }
+                    KeyboardPill("↵", Modifier.weight(1.2f), isPrimary = true) {
+                        onKey(28, true); onKey(28, false)
+                    }
+                }
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    KeyboardPill("Home", Modifier.weight(1.0f)) { onKey(102, true); onKey(102, false) }
+                    KeyboardPill("End", Modifier.weight(0.95f)) { onKey(107, true); onKey(107, false) }
+                    KeyboardPill("PgUp", Modifier.weight(1.0f)) { onKey(104, true); onKey(104, false) }
+                    KeyboardPill("PgDn", Modifier.weight(1.0f)) { onKey(109, true); onKey(109, false) }
+                    KeyboardPill("Space", Modifier.weight(2.0f)) { onKey(57, true); onKey(57, false) }
+                    KeyboardPill("←", Modifier.weight(0.9f)) { onKey(105, true); onKey(105, false) }
+                    KeyboardPill("↑", Modifier.weight(0.9f)) { onKey(103, true); onKey(103, false) }
+                    KeyboardPill("↓", Modifier.weight(0.9f)) { onKey(108, true); onKey(108, false) }
+                    KeyboardPill("→", Modifier.weight(0.9f)) { onKey(106, true); onKey(106, false) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun KeyboardPill(
+    label: String,
+    modifier: Modifier = Modifier,
+    isPrimary: Boolean = false,
+    customColor: Color? = null,
+    customBorder: Color? = null,
+    textColor: Color? = null,
+    onClick: () -> Unit,
+) {
+    val bgColor = when {
+        isPrimary -> MaterialTheme.colorScheme.primary
+        customColor != null -> customColor
+        else -> Color(0xFF242436)
+    }
+    val borderColor = when {
+        isPrimary -> MaterialTheme.colorScheme.primary
+        customBorder != null -> customBorder
+        else -> Color.White.copy(alpha = 0.10f)
+    }
+    val contentColor = when {
+        isPrimary -> MaterialTheme.colorScheme.onPrimary
+        textColor != null -> textColor
+        else -> Color(0xFFEEEEEE)
+    }
+
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(8.dp),
+        color = bgColor,
+        border = BorderStroke(1.dp, borderColor),
+        modifier = modifier.height(35.dp),
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = if (isPrimary || textColor != null) FontWeight.Bold else FontWeight.Medium,
+                color = contentColor,
+                fontSize = 11.5.sp,
+            )
+        }
+    }
+}
+
+@Composable
+private fun KeyboardTogglePill(
+    label: String,
+    isActive: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(8.dp),
+        color = if (isActive) MaterialTheme.colorScheme.primary else Color(0xFF242436),
+        border = BorderStroke(
+            1.dp,
+            if (isActive) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.10f),
+        ),
+        modifier = modifier.height(35.dp),
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = if (isActive) FontWeight.Bold else FontWeight.Medium,
+                color = if (isActive) MaterialTheme.colorScheme.onPrimary else Color(0xFFEEEEEE),
+                fontSize = 11.5.sp,
+            )
+        }
+    }
+}
+
+private fun sendChar(c: Char, onKey: (Int, Boolean) -> Unit) {
+    val shiftedChars = mapOf(
+        '!' to 2, '@' to 3, '#' to 4, '$' to 5, '%' to 6,
+        '^' to 7, '&' to 8, '*' to 9, '(' to 10, ')' to 11,
+        '_' to 12, '+' to 13, '{' to 26, '}' to 27, ':' to 39,
+        '"' to 40, '~' to 41, '|' to 43, '<' to 51, '>' to 52, '?' to 53,
+    )
+    if (c in 'A'..'Z') {
+        val code = keyCodeFor(c)
+        if (code != 0) {
+            onKey(42, true)
+            onKey(code, true)
+            onKey(code, false)
+            onKey(42, false)
+        }
+    } else if (c in shiftedChars) {
+        val code = shiftedChars[c] ?: return
+        onKey(42, true)
+        onKey(code, true)
+        onKey(code, false)
+        onKey(42, false)
+    } else {
+        val code = keyCodeFor(c)
+        if (code != 0) {
+            onKey(code, true)
+            onKey(code, false)
+        }
+    }
+}
+
+private fun keyCodeFor(c: Char): Int = when (c) {
+    '0' -> 11; '1' -> 2; '2' -> 3; '3' -> 4; '4' -> 5
+    '5' -> 6; '6' -> 7; '7' -> 8; '8' -> 9; '9' -> 10
+    'q','Q' -> 16; 'w','W' -> 17; 'e','E' -> 18; 'r','R' -> 19; 't','T' -> 20
+    'y','Y' -> 21; 'u','U' -> 22; 'i','I' -> 23; 'o','O' -> 24; 'p','P' -> 25
+    'a','A' -> 30; 's','S' -> 31; 'd','D' -> 32; 'f','F' -> 33; 'g','G' -> 34
+    'h','H' -> 35; 'j','J' -> 36; 'k','K' -> 37; 'l','L' -> 38
+    'z','Z' -> 44; 'x','X' -> 45; 'c','C' -> 46; 'v','V' -> 47; 'b','B' -> 48
+    'n','N' -> 49; 'm','M' -> 50
+    ' ' -> 57
+    '\n' -> 28
+    '\t' -> 15
+    '-' -> 12; '=' -> 13
+    '[' -> 26; ']' -> 27
+    ';' -> 39; '\'' -> 40
+    '`' -> 41; '\\' -> 43
+    ',' -> 51; '.' -> 52; '/' -> 53
+    else -> 0
+}

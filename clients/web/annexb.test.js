@@ -1,0 +1,205 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const annexb = require("./annexb.js");
+
+function dg(seq, frag, frags, key, pts, sent, payload) {
+    const out = new Uint8Array(24 + payload.length);
+    out[0] = 1;
+    out[1] = key ? 1 : 0;
+    const view = new DataView(out.buffer);
+    view.setUint16(2, seq, true);
+    view.setUint16(4, frag, true);
+    view.setUint16(6, frags, true);
+    view.setBigUint64(8, BigInt(pts), true);
+    view.setBigUint64(16, BigInt(sent), true);
+    out.set(payload, 24);
+    return out;
+}
+
+test("codec string from High@4.0 SPS", () => {
+    const sps = annexb.withStartCode(Uint8Array.of(0x67, 0x64, 0x00, 0x28, 0xac));
+    assert.equal(annexb.codecStringFromSps(sps), "avc1.640028");
+});
+
+test("extracts SPS/PPS from an IDR AU", () => {
+    const sps = annexb.withStartCode(Uint8Array.of(0x67, 0x64, 0x00, 0x28, 0xac));
+    const pps = annexb.withStartCode(Uint8Array.of(0x68, 0xee, 0x3c, 0x80));
+    const slice = annexb.withStartCode(Uint8Array.of(0x65, 0x88));
+    const au = new Uint8Array(sps.length + pps.length + slice.length);
+    au.set(sps, 0);
+    au.set(pps, sps.length);
+    au.set(slice, sps.length + pps.length);
+    const found = annexb.extractSpsPps(au);
+    assert.deepEqual(Array.from(found.sps), Array.from(sps));
+    assert.deepEqual(Array.from(found.pps), Array.from(pps));
+});
+
+test("hello frame encodes a complete length-prefixed body", () => {
+    const frame = annexb.encodeHello("tok", "sess-1");
+    const split = annexb.splitFrame(frame);
+    assert.ok(split);
+    assert.equal(split.used, frame.length);
+    assert.equal(split.body[0], annexb.TYPE_HELLO);
+});
+
+test("frame reader reassembles split chunks", () => {
+    const frame = annexb.encodeCtrl(annexb.TYPE_IDR);
+    const reader = new annexb.FrameReader();
+    reader.push(frame.subarray(0, 3));
+    assert.equal(reader.pop(), null);
+    reader.push(frame.subarray(3));
+    const msg = reader.pop();
+    assert.equal(msg.type, "idr");
+    assert.equal(reader.pop(), null);
+});
+
+test("video message decode", () => {
+    const au = Uint8Array.of(0, 0, 0, 1, 0x65, 9);
+    const body = new Uint8Array(1 + 1 + 8 + 8 + au.length);
+    body[0] = annexb.TYPE_VIDEO;
+    body[1] = 1;
+    body[2] = 42;
+    body.set(au, 18);
+    const frame = annexb.encodeFrame(body);
+    const msg = annexb.decodeMessage(annexb.splitFrame(frame).body);
+    assert.equal(msg.type, "video");
+    assert.equal(msg.key, true);
+    assert.equal(msg.ptsNs, 42n);
+    assert.deepEqual(Array.from(msg.au), Array.from(au));
+});
+
+test("classifies IDR as I and P-slice as P", () => {
+    const idr = annexb.withStartCode(Uint8Array.of(0x65, 0x88));
+    assert.equal(annexb.classifyAccessUnit(idr), "I");
+});
+
+test("pickWtHost prefers the page host when it is not loopback", () => {
+    assert.equal(annexb.pickWtHost({ wt_hosts: ["10.0.0.5"] }, "192.168.1.8"), "192.168.1.8");
+    assert.equal(annexb.pickWtHost({ wt_hosts: ["10.0.0.5", "127.0.0.1"] }, "127.0.0.1"), "10.0.0.5");
+    assert.equal(annexb.pickWtHost({ wt_hosts: ["127.0.0.1"] }, "localhost"), "127.0.0.1");
+});
+
+test("datagram assembler rebuilds a split AU and reports a gap after the hole wait", () => {
+    const au = Uint8Array.from({ length: 40 }, (_, i) => i);
+    const a = dg(4, 0, 2, true, 1n, 2n, au.subarray(0, 20));
+    const b = dg(4, 1, 2, true, 1n, 2n, au.subarray(20));
+    const asm = new annexb.DatagramAssembler();
+    assert.deepEqual(asm.push(a, 0), []);
+    const msg = asm.push(b, 0);
+    assert.equal(msg.length, 1);
+    assert.equal(msg[0].type, "video");
+    assert.equal(msg[0].key, true);
+    assert.deepEqual(Array.from(msg[0].au), Array.from(au));
+
+    const next = dg(6, 0, 1, false, 3n, 4n, au.subarray(0, 8));
+    assert.deepEqual(asm.push(next, 0), []);
+    assert.deepEqual(asm.expire(annexb.HOLE_WAIT_MS - 1), []);
+    const gap = asm.expire(annexb.HOLE_WAIT_MS);
+    assert.equal(gap.length, 1);
+    assert.equal(gap[0].type, "gap");
+    assert.equal(gap[0].dropped, 1);
+    assert.deepEqual(asm.expire(annexb.HOLE_WAIT_MS * 2), []);
+});
+
+test("datagram assembler ignores a late AU and does not rewind lastSeq", () => {
+    const payload = Uint8Array.of(1, 2, 3, 4);
+    const asm = new annexb.DatagramAssembler();
+    const first = asm.push(dg(10, 0, 1, true, 1n, 2n, payload), 0);
+    assert.equal(first[0].type, "video");
+    assert.equal(first[0].key, true);
+
+    const late = dg(8, 0, 1, false, 3n, 4n, payload);
+    assert.deepEqual(asm.push(late, 0), []);
+    assert.deepEqual(asm.push(dg(10, 0, 1, true, 1n, 2n, payload), 0), []);
+
+    const inOrder = asm.push(dg(11, 0, 1, false, 5n, 6n, payload), 0);
+    assert.equal(inOrder[0].type, "video");
+    assert.equal(inOrder[0].key, false);
+});
+
+test("datagram assembler treats wrap from 65535 to 0 as in-order", () => {
+    const payload = Uint8Array.of(9);
+    const asm = new annexb.DatagramAssembler();
+    assert.equal(asm.push(dg(65535, 0, 1, true, 1n, 2n, payload), 0)[0].type, "video");
+    const wrapped = asm.push(dg(0, 0, 1, false, 3n, 4n, payload), 0);
+    assert.equal(wrapped[0].type, "video");
+    assert.equal(wrapped[0].key, false);
+});
+
+test("datagram assembler plays 11 then 12 when 12 arrives first", () => {
+    const payload = Uint8Array.of(1, 2, 3, 4);
+    const asm = new annexb.DatagramAssembler();
+    assert.equal(asm.push(dg(10, 0, 1, true, 1n, 2n, payload), 0)[0].seq, 10);
+    assert.deepEqual(asm.push(dg(12, 0, 1, false, 3n, 4n, payload), 0), []);
+    const filled = asm.push(dg(11, 0, 1, false, 5n, 6n, payload), 10);
+    assert.deepEqual(filled.map((m) => m.seq), [11, 12]);
+    assert.equal(filled.every((m) => m.type === "video"), true);
+    assert.deepEqual(asm.expire(10 + annexb.HOLE_WAIT_MS), []);
+});
+
+test("datagram assembler emits gap if the hole never fills", () => {
+    const payload = Uint8Array.of(7);
+    const asm = new annexb.DatagramAssembler();
+    asm.push(dg(10, 0, 1, true, 1n, 2n, payload), 0);
+    assert.deepEqual(asm.push(dg(12, 0, 1, false, 3n, 4n, payload), 0), []);
+    const gap = asm.expire(annexb.HOLE_WAIT_MS);
+    assert.equal(gap.length, 1);
+    assert.equal(gap[0].type, "gap");
+    const late = asm.push(dg(11, 0, 1, false, 5n, 6n, payload), annexb.HOLE_WAIT_MS + 1);
+    assert.equal(late[0].type, "video");
+    assert.equal(late[0].seq, 11);
+});
+
+test("hashFromBase64 yields 32 bytes", () => {
+    const raw = Uint8Array.from({ length: 32 }, (_, i) => i);
+    const b64 = Buffer.from(raw).toString("base64");
+    assert.deepEqual(Array.from(annexb.hashFromBase64(b64)), Array.from(raw));
+});
+
+test("parity ladder matches the host", () => {
+    assert.equal(annexb.parityCount(1), 0);
+    assert.equal(annexb.parityCount(3), 0);
+    assert.equal(annexb.parityCount(4), 2);
+    assert.equal(annexb.parityCount(16), 2);
+    assert.equal(annexb.parityCount(17), 3);
+    assert.equal(annexb.parityCount(64), 3);
+    assert.equal(annexb.parityCount(65), 4);
+});
+
+test("a truncated PING frame reports truncation instead of throwing on BigInt", () => {
+    assert.throws(
+        () => annexb.decodeMessage(Uint8Array.of(4)),
+        /truncated/,
+    );
+});
+
+test("a well-formed PING frame still decodes", () => {
+    const msg = annexb.decodeMessage(annexb.encodePing(1234n).subarray(4));
+    assert.equal(msg.type, "ping");
+    assert.equal(msg.t0Ns, 1234n);
+});
+
+test("FrameReader drops the reassembly buffer instead of growing without bound", () => {
+    const reader = new annexb.FrameReader();
+    const chunk = new Uint8Array(64 * 1024);
+    chunk.set([0x00, 0x10, 0x00, 0x00], 0);
+    for (let i = 0; i < 80; i += 1) reader.push(chunk);
+    assert.ok(
+        reader.buf.length <= annexb.MAX_FRAME,
+        `buffer grew to ${reader.buf.length}, above MAX_FRAME ${annexb.MAX_FRAME}`,
+    );
+    assert.ok(
+        reader.buf.length < 80 * 64 * 1024,
+        `buffer was never reset (${reader.buf.length} bytes)`,
+    );
+    assert.equal(reader.pop(), null);
+});
+
+test("FrameReader still decodes a complete frame", () => {
+    const reader = new annexb.FrameReader();
+    reader.push(annexb.encodePing(7n));
+    const msg = reader.pop();
+    assert.equal(msg.type, "ping");
+    assert.equal(msg.t0Ns, 7n);
+    assert.equal(reader.pop(), null);
+});

@@ -1,0 +1,23 @@
+# ─────────────────────────────────────────────
+# Orbiscreen - Desktop Entry
+# https://github.com/shadow-x78/orbiscreen
+# ─────────────────────────────────────────────
+
+# ── Identity ──
+[Desktop Entry]
+Name=Orbiscreen
+Comment=Turn Android devices into high-performance secondary monitors for Linux
+
+# ── Launcher ──
+Exec=orbiscreen-gui
+Icon=orbiscreen
+Terminal=false
+Type=Application
+
+# ── Classification ──
+Categories=Utility;HardwareSettings;
+Keywords=monitor;display;virtual;screen;second;android;
+
+# ── Window Matching ──
+StartupNotify=true
+StartupWMClass=orbiscreen.gui

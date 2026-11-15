@@ -1,0 +1,42 @@
+#!/bin/sh
+# ─────────────────────────────────────────────
+# Orbiscreen - Gradle Wrapper Starter (POSIX)
+# ─────────────────────────────────────────────
+
+# ── First-Run Bootstrap ──
+# Downloads `gradle-wrapper.jar` from the official Gradle
+# distribution server. Operators who already have a
+# system-wide `gradle` may instead run: `gradle assembleDebug`.
+
+set -e
+
+APP_HOME="$(cd "$(dirname "$0")" && pwd -P)"
+WRAPPER_JAR="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+
+if [ ! -f "$WRAPPER_JAR" ]; then
+    echo "Downloading gradle-wrapper.jar..." >&2
+    mkdir -p "$(dirname "$WRAPPER_JAR")"
+    curl -sSL \
+        https://raw.githubusercontent.com/gradle/gradle/v8.9.0/gradle/wrapper/gradle-wrapper.jar \
+        -o "$WRAPPER_JAR"
+    echo "498495120a03b9a6ab5d155f5de3c8f0d986a449153702fb80fc80e134484f17  $WRAPPER_JAR" \
+        | sha256sum -c - >/dev/null 2>&1 || {
+            echo "error: gradle-wrapper.jar checksum mismatch; refusing to run" >&2
+            rm -f "$WRAPPER_JAR"
+            exit 1
+        }
+fi
+
+JAVACMD="java"
+if [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+    JAVACMD="$JAVA_HOME/bin/java"
+elif command -v java >/dev/null 2>&1; then
+    JAVACMD="java"
+elif [ -x "/usr/bin/java" ]; then
+    JAVACMD="/usr/bin/java"
+fi
+
+exec "$JAVACMD" \
+    -Dorg.gradle.appname="$(basename "$0")" \
+    -classpath "$WRAPPER_JAR" \
+    org.gradle.wrapper.GradleWrapperMain "$@"

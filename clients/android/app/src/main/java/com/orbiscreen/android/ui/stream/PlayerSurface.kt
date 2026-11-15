@@ -1,0 +1,353 @@
+
+package com.orbiscreen.android.ui.stream
+
+import android.content.Context
+import android.graphics.Color
+import android.util.Log
+import android.view.MotionEvent
+import android.view.SurfaceHolder
+import android.view.SurfaceView
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import androidx.annotation.OptIn
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.key
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
+import com.orbiscreen.android.player.SurfaceTarget
+import kotlin.math.roundToInt
+
+private const val TAG = "Orbi.Surface"
+
+private class TouchCallbacksHolder(
+    var isTouchMode: Boolean,
+    var onPointer: (Float?, Float?, Int, Int, Int, Boolean) -> Unit,
+    var onTouch: (Int, Int, Float, Float, Int, Int, Boolean, Boolean) -> Unit,
+    var onDeltaMove: (Float, Float) -> Unit,
+    var onLeftClick: () -> Unit,
+    var onRightClick: () -> Unit,
+    var onScroll: (Double) -> Unit,
+    var onStylus: ((Float, Float, Int, Int, Float, Float, Float) -> Unit)? = null,
+    var scaleMode: Int = 0,
+    var streamWidth: Int = 1920,
+    var streamHeight: Int = 1080,
+)
+
+private class UdpVideoLayout(ctx: Context) : FrameLayout(ctx) {
+    private val surfaceView = SurfaceView(ctx)
+    private var bound: SurfaceTarget? = null
+    private var streamW = 1920
+    private var streamH = 1080
+    private var scaleMode = 0
+    private val callback = object : SurfaceHolder.Callback {
+        override fun surfaceCreated(sh: SurfaceHolder) {
+            bound?.attachSurface(sh.surface)
+        }
+        override fun surfaceChanged(sh: SurfaceHolder, format: Int, w: Int, hgt: Int) {
+            bound?.attachSurface(sh.surface)
+        }
+        override fun surfaceDestroyed(sh: SurfaceHolder) {
+            bound?.detachSurface()
+        }
+    }
+
+    init {
+        setBackgroundColor(Color.BLACK)
+        keepScreenOn = true
+        surfaceView.holder.addCallback(callback)
+        addView(surfaceView)
+    }
+
+    fun bindPlayer(target: SurfaceTarget?) {
+        if (bound === target) {
+            if (target != null && surfaceView.holder.surface.isValid) {
+                target.attachSurface(surfaceView.holder.surface)
+            }
+            return
+        }
+        bound?.detachSurface()
+        bound = target
+        if (target != null && surfaceView.holder.surface.isValid) {
+            target.attachSurface(surfaceView.holder.surface)
+        }
+    }
+
+    fun setStream(width: Int, height: Int, mode: Int) {
+        if (streamW == width && streamH == height && scaleMode == mode) return
+        streamW = width
+        streamH = height
+        scaleMode = mode
+        requestLayout()
+    }
+
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        val cr = computeContentRect(right - left, bottom - top, streamW, streamH, scaleMode)
+        val sl = cr.offsetX.roundToInt()
+        val st = cr.offsetY.roundToInt()
+        surfaceView.layout(sl, st, sl + cr.w.roundToInt().coerceAtLeast(1), st + cr.h.roundToInt().coerceAtLeast(1))
+    }
+}
+
+@OptIn(UnstableApi::class)
+@Composable
+fun PlayerSurface(
+    player: ExoPlayer?,
+    modifier: Modifier = Modifier,
+    udp: SurfaceTarget? = null,
+    isTouchMode: Boolean,
+    onPointer: (Float?, Float?, Int, Int, Int, Boolean) -> Unit,
+    onTouch: (Int, Int, Float, Float, Int, Int, Boolean, Boolean) -> Unit,
+    onDeltaMove: (Float, Float) -> Unit,
+    onLeftClick: () -> Unit,
+    onRightClick: () -> Unit,
+    onScroll: (Double) -> Unit,
+    streamWidth: Int = 1920,
+    streamHeight: Int = 1080,
+    scaleMode: Int = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT,
+    onStylus: ((Float, Float, Int, Int, Float, Float, Float) -> Unit)? = null,
+) {
+    val holder = remember {
+        TouchCallbacksHolder(
+            isTouchMode = isTouchMode,
+            onPointer = onPointer,
+            onTouch = onTouch,
+            onDeltaMove = onDeltaMove,
+            onLeftClick = onLeftClick,
+            onRightClick = onRightClick,
+            onScroll = onScroll,
+            onStylus = onStylus,
+        )
+    }
+
+    holder.isTouchMode = isTouchMode
+    holder.scaleMode = scaleMode
+    holder.streamWidth = streamWidth
+    holder.streamHeight = streamHeight
+    holder.onPointer = onPointer
+    holder.onTouch = onTouch
+    holder.onDeltaMove = onDeltaMove
+    holder.onLeftClick = onLeftClick
+    holder.onRightClick = onRightClick
+    holder.onScroll = onScroll
+    holder.onStylus = onStylus
+
+    key(udp != null) {
+    AndroidView(
+        modifier = modifier.fillMaxSize(),
+        factory = { ctx ->
+            var lastX = 0f
+            var lastY = 0f
+            var downTime = 0L
+            var moved = false
+            var maxPointers = 1
+
+            var lastTapTime = 0L
+            var lastTapX = 0f
+            var lastTapY = 0f
+            var isDragging = false
+            val doubleTapMaxMs = 450L
+            val doubleTapMaxDistPx = 140f
+
+            val video = if (udp != null) {
+                UdpVideoLayout(ctx).apply {
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                    )
+                    bindPlayer(udp)
+                    setStream(holder.streamWidth, holder.streamHeight, holder.scaleMode)
+                }
+            } else {
+            PlayerView(ctx).apply {
+                useController = false
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                )
+                setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
+                keepScreenOn = true
+                resizeMode = scaleMode
+                this.player = player
+            }
+            }
+            video.apply {
+                keepScreenOn = true
+                isClickable = true
+                isFocusable = true
+                requestFocus()
+
+                setOnGenericMotionListener { _, ev ->
+                    val toolType = ev.getToolType(0)
+                    val isStylusTool =
+                        toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER
+                    if (isStylusTool && holder.onStylus != null) {
+                        val cr = computeContentRect(width, height, holder.streamWidth, holder.streamHeight, holder.scaleMode)
+                        val cx = (ev.x - cr.offsetX).coerceIn(0f, cr.w)
+                        val cy = (ev.y - cr.offsetY).coerceIn(0f, cr.h)
+                        val pressure = ev.pressure
+                        val tiltRad = ev.getAxisValue(MotionEvent.AXIS_TILT)
+                        val altitudeDeg = Math.toDegrees(tiltRad.toDouble()).toFloat()
+                        val orientationRad = ev.getAxisValue(MotionEvent.AXIS_ORIENTATION)
+                        val tiltX = (altitudeDeg * kotlin.math.sin(orientationRad)).toFloat()
+                        val tiltY = (-altitudeDeg * kotlin.math.cos(orientationRad)).toFloat()
+                        holder.onStylus?.invoke(cx, cy, cr.w.toInt(), cr.h.toInt(), pressure, tiltX, tiltY)
+                        true
+                    } else false
+                }
+
+                setOnTouchListener { view, ev ->
+                    val w = width
+                    val hPx = height
+
+                    val toolType = ev.getToolType(0)
+                    val isStylus = toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER
+                    if (isStylus && holder.onStylus != null) {
+                        val cr = computeContentRect(w, hPx, holder.streamWidth, holder.streamHeight, holder.scaleMode)
+                        val cx = (ev.x - cr.offsetX).coerceIn(0f, cr.w)
+                        val cy = (ev.y - cr.offsetY).coerceIn(0f, cr.h)
+                        val pressure = if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) 0f else ev.pressure.coerceAtLeast(0.1f)
+                        val tiltRad = ev.getAxisValue(MotionEvent.AXIS_TILT)
+                        val altitudeDeg = Math.toDegrees(tiltRad.toDouble()).toFloat()
+                        val orientationRad = ev.getAxisValue(MotionEvent.AXIS_ORIENTATION)
+                        val tiltX = (altitudeDeg * kotlin.math.sin(orientationRad)).toFloat()
+                        val tiltY = (-altitudeDeg * kotlin.math.cos(orientationRad)).toFloat()
+                        holder.onStylus?.invoke(cx, cy, cr.w.toInt(), cr.h.toInt(), pressure, tiltX, tiltY)
+                        return@setOnTouchListener true
+                    }
+
+                    if (holder.isTouchMode) {
+                        val cr = computeContentRect(w, hPx, holder.streamWidth, holder.streamHeight, holder.scaleMode)
+                        val cw = cr.w.toInt().coerceAtLeast(1)
+                        val ch = cr.h.toInt().coerceAtLeast(1)
+                        val mapped = { idx: Int ->
+                            val mx = (ev.getX(idx) - cr.offsetX).coerceIn(0f, cr.w)
+                            val my = (ev.getY(idx) - cr.offsetY).coerceIn(0f, cr.h)
+                            mx to my
+                        }
+                        val emitTouch = { idx: Int, pressed: Boolean, coalesce: Boolean ->
+                            val id = ev.getPointerId(idx)
+                            val slot = id.coerceIn(0, 9)
+                            val (tx, ty) = mapped(idx)
+                            holder.onTouch(slot, id, tx, ty, cw, ch, pressed, coalesce)
+                        }
+
+                        when (ev.actionMasked) {
+                            MotionEvent.ACTION_DOWN -> {
+                                emitTouch(0, true, false)
+                            }
+                            MotionEvent.ACTION_POINTER_DOWN -> {
+                                emitTouch(ev.actionIndex, true, false)
+                            }
+                            MotionEvent.ACTION_MOVE -> {
+                                for (i in 0 until ev.pointerCount) {
+                                    emitTouch(i, true, true)
+                                }
+                            }
+                            MotionEvent.ACTION_POINTER_UP -> {
+                                emitTouch(ev.actionIndex, false, false)
+                            }
+                            MotionEvent.ACTION_UP -> {
+                                emitTouch(0, false, false)
+                            }
+                            MotionEvent.ACTION_CANCEL -> {
+                                for (i in 0 until ev.pointerCount) {
+                                    emitTouch(i, false, false)
+                                }
+                            }
+                        }
+                    } else {
+                        val now = System.currentTimeMillis()
+                        when (ev.actionMasked) {
+                            MotionEvent.ACTION_DOWN -> {
+                                val timeSinceLast = now - lastTapTime
+                                val dxTap = ev.x - lastTapX
+                                val dyTap = ev.y - lastTapY
+                                val distTap = kotlin.math.sqrt((dxTap * dxTap + dyTap * dyTap).toDouble()).toFloat()
+                                if (timeSinceLast < doubleTapMaxMs && distTap < doubleTapMaxDistPx) {
+                                    isDragging = true
+                                    holder.onPointer(null, null, w, hPx, 1, true)
+                                } else {
+                                    isDragging = false
+                                }
+                                lastX = ev.x
+                                lastY = ev.y
+                                downTime = now
+                                moved = false
+                                maxPointers = 1
+                            }
+                            MotionEvent.ACTION_POINTER_DOWN -> {
+                                if (ev.pointerCount > maxPointers) maxPointers = ev.pointerCount
+                            }
+                            MotionEvent.ACTION_MOVE -> {
+                                if (ev.pointerCount == 1) {
+                                    val dx = ev.x - lastX
+                                    val dy = ev.y - lastY
+                                    if (kotlin.math.abs(dx) > 1.5f || kotlin.math.abs(dy) > 1.5f) {
+                                        moved = true
+                                        holder.onDeltaMove(dx, dy)
+                                        lastX = ev.x
+                                        lastY = ev.y
+                                    }
+                                } else if (ev.pointerCount >= 2) {
+                                    val dy = ev.getY(0) - lastY
+                                    if (kotlin.math.abs(dy) > 4f) {
+                                        moved = true
+                                        holder.onScroll(if (dy > 0) -1.0 else 1.0)
+                                        lastY = ev.getY(0)
+                                    }
+                                }
+                            }
+                            MotionEvent.ACTION_UP -> {
+                                if (isDragging) {
+                                    holder.onPointer(null, null, w, hPx, 1, false)
+                                    isDragging = false
+                                    lastTapTime = 0L
+                                } else {
+                                    val duration = now - downTime
+                                    if (!moved && duration < 300L) {
+                                        view.performClick()
+                                        if (maxPointers >= 2) {
+                                            lastTapTime = 0L
+                                            holder.onRightClick()
+                                            Log.d(TAG, "rightClick")
+                                        } else {
+                                            lastTapTime = now
+                                            lastTapX = ev.x
+                                            lastTapY = ev.y
+                                            holder.onLeftClick()
+                                            Log.d(TAG, "leftClick")
+                                        }
+                                    }
+                                }
+                            }
+                            MotionEvent.ACTION_CANCEL -> {
+                                if (isDragging) {
+                                    holder.onPointer(null, null, w, hPx, 1, false)
+                                    isDragging = false
+                                }
+                                moved = false
+                            }
+                        }
+                    }
+                    true
+                }
+            }
+        },
+        update = { view ->
+            (view as? PlayerView)?.let {
+                it.player = player
+                it.resizeMode = scaleMode
+            }
+            (view as? UdpVideoLayout)?.let {
+                it.bindPlayer(udp)
+                it.setStream(holder.streamWidth, holder.streamHeight, holder.scaleMode)
+            }
+        },
+    )
+    }
+}

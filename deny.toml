@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────
+# Orbiscreen - Cargo Deny Configuration
+# https://github.com/shadow-x78/orbiscreen
+# ─────────────────────────────────────────────
+
+# ── Licenses ──
+[licenses]
+allow = [
+    "GPL-3.0-or-later",
+    "LGPL-2.1-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "Zlib",
+    "ISC",
+    "Unlicense",
+]
+
+# ── Graph ──
+[graph]
+all-features = false
+
+# ── Advisories ──
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+  # ── Unmaintained: `derivative` / `proc-macro-error` come from `syn` 1.x via `zvariant_derive` ──
+  "RUSTSEC-2024-0388",
+  # ── Unmaintained: rustls-pemfile 2.x, no maintained upgrade on axum-server 0.7 ──
+  # ── Unmaintained: `unic-*` 0.9 crates, pulled in by an old `deunicode` dependency ──
+  "RUSTSEC-2025-0134",
+  "RUSTSEC-2026-0370",
+  "RUSTSEC-2026-0371",
+  "RUSTSEC-2026-0372",
+]
+
+# ── Bans ──
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+allow-wildcard-paths = true

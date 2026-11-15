@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────
+# Orbiscreen - Packit Configuration (COPR)
+# https://github.com/shadow-x78/orbiscreen
+# ─────────────────────────────────────────────
+
+# ── Source Specification ──
+specfile_path: data/orbiscreen-copr.spec
+files_to_sync:
+  - data/orbiscreen-copr.spec
+  - .packit.yaml
+  - orbiscreen-vendor-*.tar.zst
+
+upstream_package_name: orbiscreen
+downstream_package_name: orbiscreen
+
+# ── RPM Environment & Dependencies ──
+srpm_build_deps:
+  - cargo
+  - git-core
+  - zstd
+
+# ── Packaging Actions ──
+actions:
+  get-current-version:
+    - bash scripts/packit-get-version.sh
+  create-archive:
+    - bash scripts/packit-archive.sh
+
+# ── Build & Publishing Jobs ──
+jobs:
+  - job: copr_build
+    trigger: pull_request
+    targets:
+      - fedora-stable
+    owner: shadow-x78
+    project: orbiscreen
+
+  - job: copr_build
+    trigger: release
+    targets:
+      - fedora-stable
+    owner: shadow-x78
+    project: orbiscreen

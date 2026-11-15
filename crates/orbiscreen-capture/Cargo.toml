@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────
+# Orbiscreen - orbiscreen-capture Crate Manifest 
+# ─────────────────────────────────────────────
+
+[package]
+name = "orbiscreen-capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Screen capture for X11 (x11rb) and Wayland (ashpd + PipeWire)"
+
+[lints]
+workspace = true
+
+[dependencies]
+orbiscreen-core = { path = "../orbiscreen-core" }
+x11rb = { workspace = true }
+ashpd = { workspace = true }
+enumflags2 = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+gstreamer = { workspace = true }
+gstreamer-app = { workspace = true }
+wayland-client = { workspace = true }
+wayland-protocols-plasma = { workspace = true }
+libc = { workspace = true }
+wayland-protocols-wlr = { workspace = true }

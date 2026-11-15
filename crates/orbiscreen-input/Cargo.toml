@@ -1,0 +1,40 @@
+# ─────────────────────────────────────────────
+# Orbiscreen - orbiscreen-input Crate Manifest 
+# ─────────────────────────────────────────────
+
+[package]
+name = "orbiscreen-input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Input injection: uinput/XTest for X11, wlroots virtual-pointer/virtual-keyboard or RemoteDesktop portal for Wayland"
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["wayland-backend"]
+
+[dependencies]
+orbiscreen-core = { path = "../orbiscreen-core" }
+evdevil = { workspace = true }
+ashpd = { workspace = true }
+enumflags2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+wayland-backend = { workspace = true }
+wayland-client = { workspace = true }
+wayland-protocols-wlr = { workspace = true }
+wayland-scanner = { workspace = true }
+xkbcommon = { workspace = true }
+libc = { workspace = true }
+x11rb = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

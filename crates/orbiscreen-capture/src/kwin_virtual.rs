@@ -1,0 +1,1131 @@
+use std::io::Write as _;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use thiserror::Error;
+use tracing::instrument;
+use wayland_client::backend::WaylandError;
+use wayland_client::protocol::wl_registry::{self, WlRegistry};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
+use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_stream_unstable_v1::{
+    Event as StreamEvent, ZkdeScreencastStreamUnstableV1,
+};
+use wayland_protocols_plasma::screencast::v1::client::zkde_screencast_unstable_v1::ZkdeScreencastUnstableV1;
+
+use super::pipewire::{PipewireCapture, PipewireSpec};
+use super::CaptureError;
+use orbiscreen_core::frame::CapturedFrame;
+
+const POINTER_EMBEDDED: u32 = 2;
+
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
+const EVENT_POLL_TIMEOUT_MS: i32 = 100;
+
+const KWIN_INTERFACES_KEY: &str = "X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1";
+const PERMISSION_FILE_NAME: &str = "orbiscreen.kwin.desktop";
+
+pub use orbiscreen_core::output::{
+    client_protocol_names as protocol_names_for, sanitize_client_name, VIRTUAL_OUTPUT_CONNECTOR,
+};
+
+pub async fn ensure_output_enabled(connector: &str) -> bool {
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let next_x = next_available_output_x(connector);
+    let enable = format!("output.{connector}.enable");
+    let scale = format!("output.{connector}.scale.1");
+    let position = format!("output.{connector}.position.{next_x},0");
+    for attempt in 1..=5 {
+        let status = tokio::process::Command::new("kscreen-doctor")
+            .arg(&enable)
+            .arg(&scale)
+            .arg(&position)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        if let Ok(status) = status {
+            if status.success() {
+                tracing::info!(connector, next_x, "enabled and scaled KWin output");
+                return true;
+            }
+        }
+        if attempt < 5 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+    tracing::warn!(connector, "KWin output did not accept enable/position");
+    false
+}
+
+#[derive(Debug, Clone)]
+pub struct KwinVirtualSpec {
+    pub width: u32,
+    pub height: u32,
+    pub names: Vec<String>,
+    pub description: String,
+    pub refresh_hz: u32,
+}
+
+impl KwinVirtualSpec {
+    pub fn unnamed(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            names: Vec::new(),
+            description: "Orbiscreen Virtual Display".into(),
+            refresh_hz: 60,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum KwinVirtualError {
+    #[error("KWin screencast protocol (zkde_screencast_unstable_v1) is not available on this compositor")]
+    ProtocolUnavailable,
+    #[error("compositor is too old: virtual output streaming needs protocol version >= 2")]
+    ProtocolTooOld,
+    #[error("requested size {0}x{1} exceeds the protocol's i32 dimensions")]
+    UnsupportedSize(u32, u32),
+    #[error("KWin rejected the virtual output stream: {0}")]
+    StreamFailed(String),
+    #[error("timed out waiting for KWin to create the virtual output stream")]
+    Timeout,
+    #[error("wayland error: {0}")]
+    Wayland(String),
+}
+
+impl From<KwinVirtualError> for CaptureError {
+    fn from(error: KwinVirtualError) -> Self {
+        CaptureError::Io(error.to_string())
+    }
+}
+
+#[derive(Debug, Default)]
+struct StreamShared {
+    node_id: Mutex<Option<u32>>,
+    failed: Mutex<Option<String>>,
+    closed: AtomicBool,
+}
+
+#[derive(Debug, Default)]
+struct HandshakeState {
+    registry: Option<WlRegistry>,
+    screencast_global: Option<(u32, u32)>,
+}
+
+struct WaylandSession {
+    conn: Connection,
+    queue: EventQueue<HandshakeState>,
+    state: HandshakeState,
+}
+
+impl WaylandSession {
+    fn connect() -> Result<Self, KwinVirtualError> {
+        let conn =
+            Connection::connect_to_env().map_err(|e| KwinVirtualError::Wayland(e.to_string()))?;
+        let mut queue: EventQueue<HandshakeState> = conn.new_event_queue();
+        let qh = queue.handle();
+        let mut state = HandshakeState::default();
+
+        conn.display().get_registry(&qh, ());
+        queue
+            .roundtrip(&mut state)
+            .map_err(|e| KwinVirtualError::Wayland(e.to_string()))?;
+        Ok(Self { conn, queue, state })
+    }
+}
+
+impl Dispatch<WlRegistry, ()> for HandshakeState {
+    fn event(
+        state: &mut Self,
+        registry: &WlRegistry,
+        event: wl_registry::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            if interface == <ZkdeScreencastUnstableV1 as Proxy>::interface().name {
+                state.registry = Some(registry.clone());
+                state.screencast_global = Some((name, version));
+            }
+        }
+    }
+}
+
+impl Dispatch<ZkdeScreencastUnstableV1, ()> for HandshakeState {
+    fn event(
+        _: &mut Self,
+        _: &ZkdeScreencastUnstableV1,
+        _: <ZkdeScreencastUnstableV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZkdeScreencastStreamUnstableV1, Arc<StreamShared>> for HandshakeState {
+    fn event(
+        _: &mut Self,
+        _: &ZkdeScreencastStreamUnstableV1,
+        event: <ZkdeScreencastStreamUnstableV1 as Proxy>::Event,
+        shared: &Arc<StreamShared>,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            StreamEvent::Created { node } => {
+                *shared.node_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(node);
+            }
+            StreamEvent::Failed { error } => {
+                *shared.failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+            }
+            StreamEvent::Closed => {
+                shared.closed.store(true, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_kde_session() -> bool {
+    orbiscreen_core::session::Capabilities::from_env().compositor
+        == orbiscreen_core::session::Compositor::Kde
+}
+
+fn user_applications_dir() -> Option<PathBuf> {
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return Some(data_home.join("applications"));
+    }
+    let home = std::env::var_os("HOME")?;
+    let mut path = PathBuf::from(home);
+    path.push(".local/share/applications");
+    Some(path)
+}
+
+fn permission_file_matches(path: &Path, exe: &str) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_symlink() => {}
+        _ => return false,
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    content
+        .lines()
+        .any(|line| line.trim() == KWIN_INTERFACES_KEY)
+        && content.lines().any(|line| {
+            line.strip_prefix("Exec=")
+                .map(|e| e.trim() == exe)
+                .unwrap_or(false)
+        })
+}
+
+fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("permission file has no parent directory"))?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(
+        ".{name}.tmp{}",
+        std::process::id(),
+        name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("orbiscreen.kwin.desktop")
+    ));
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+    }
+
+    std::fs::rename(&tmp, path)
+}
+
+pub fn kwin_output_config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config/kwinoutputconfig.json"))
+}
+
+pub fn forget_saved_virtual_output(path: &Path, connector: &str) -> std::io::Result<bool> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let mut root: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
+    fn strip(value: &mut serde_json::Value, connector: &str) -> bool {
+        let mut changed = false;
+        match value {
+            serde_json::Value::Array(items) => {
+                let before = items.len();
+                items.retain(
+                    |entry| match entry.get("connectorName").and_then(|v| v.as_str()) {
+                        Some(name) => {
+                            name != connector && !name.starts_with(&format!("{connector}-"))
+                        }
+                        None => true,
+                    },
+                );
+                if items.len() != before {
+                    changed = true;
+                }
+                for item in items.iter_mut() {
+                    if strip(item, connector) {
+                        changed = true;
+                    }
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for child in map.values_mut() {
+                    if strip(child, connector) {
+                        changed = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        changed
+    }
+    if !strip(&mut root, connector) {
+        return Ok(false);
+    }
+    let pretty = serde_json::to_string_pretty(&root)
+        .map_err(|e| std::io::Error::other(format!("serialize kwin output config: {e}")))?;
+    atomic_write(path, &pretty)?;
+    Ok(true)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KscreenOutput {
+    pub name: String,
+    pub uuid: Option<String>,
+    pub enabled: bool,
+    pub geometry: Option<(i32, i32, u32, u32)>,
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub fn parse_kscreen_outputs(text: &str) -> Vec<KscreenOutput> {
+    let text = strip_ansi(text);
+    let mut current: Option<KscreenOutput> = None;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Output: ") {
+            if let Some(done) = current.take() {
+                out.push(done);
+            }
+            let mut parts = rest.split_whitespace();
+            let _idx = parts.next();
+            if let Some(name) = parts.next() {
+                let uuid = parts
+                    .next()
+                    .filter(|tok| tok.contains('-'))
+                    .map(str::to_string);
+                current = Some(KscreenOutput {
+                    name: name.to_string(),
+                    uuid,
+                    enabled: false,
+                    geometry: None,
+                });
+            }
+        } else if line.trim() == "enabled" {
+            if let Some(cur) = current.as_mut() {
+                cur.enabled = true;
+            }
+        } else if line.trim() == "disabled" {
+            if let Some(cur) = current.as_mut() {
+                cur.enabled = false;
+            }
+        } else if line.trim() == "disable unsupported" {
+            if let Some(cur) = current.as_mut() {
+                cur.enabled = true;
+            }
+        } else if let Some(geom) = line.trim().strip_prefix("Geometry: ") {
+            let mut parts = geom.split_whitespace();
+            if let (Some(pos), Some(size)) = (parts.next(), parts.next()) {
+                let mut pos_parts = pos.split(',');
+                let mut size_parts = size.split('x');
+                if let (Some(x_str), Some(y_str), Some(w_str), Some(h_str)) = (
+                    pos_parts.next(),
+                    pos_parts.next(),
+                    size_parts.next(),
+                    size_parts.next(),
+                ) {
+                    if let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
+                        x_str.parse::<i32>(),
+                        y_str.parse::<i32>(),
+                        w_str.parse::<u32>(),
+                        h_str.parse::<u32>(),
+                    ) {
+                        if let Some(cur) = current.as_mut() {
+                            cur.geometry = Some((x, y, w, h));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(done) = current {
+        out.push(done);
+    }
+    out
+}
+
+pub fn next_available_output_x(exclude_output: &str) -> i32 {
+    list_kscreen_outputs()
+        .into_iter()
+        .filter(|o| o.enabled && o.name != exclude_output)
+        .filter_map(|o| o.geometry)
+        .map(|(x, _y, w, _h)| x + w as i32)
+        .max()
+        .unwrap_or(0)
+}
+
+pub fn pointer_frame(connector: &str, width: u32, height: u32) -> Option<(i32, i32, u32, u32)> {
+    pointer_frame_from(&list_kscreen_outputs(), connector, width, height)
+}
+
+pub fn pointer_frame_from(
+    outputs: &[KscreenOutput],
+    connector: &str,
+    width: u32,
+    height: u32,
+) -> Option<(i32, i32, u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let (origin_x, origin_y) = outputs
+        .iter()
+        .find(|o| o.enabled && o.name == connector)
+        .and_then(|o| o.geometry)
+        .map(|(x, y, _w, _h)| (x, y))
+        .unwrap_or_else(|| (next_available_output_x_from(outputs, connector), 0));
+    let mut workspace_width = origin_x + width as i32;
+    let mut workspace_height = origin_y + height as i32;
+    for output in outputs.iter().filter(|o| o.enabled && o.name != connector) {
+        if let Some((x, y, w, h)) = output.geometry {
+            workspace_width = workspace_width.max(x + w as i32);
+            workspace_height = workspace_height.max(y + h as i32);
+        }
+    }
+    if workspace_width <= origin_x || workspace_height <= origin_y {
+        return None;
+    }
+    Some((
+        origin_x,
+        origin_y,
+        workspace_width as u32,
+        workspace_height as u32,
+    ))
+}
+
+fn next_available_output_x_from(outputs: &[KscreenOutput], exclude_output: &str) -> i32 {
+    outputs
+        .iter()
+        .filter(|o| o.enabled && o.name != exclude_output)
+        .filter_map(|o| o.geometry)
+        .map(|(x, _y, w, _h)| x + w as i32)
+        .max()
+        .unwrap_or(0)
+}
+
+fn is_portal_virtual_output(name: &str) -> bool {
+    name.starts_with("Virtual-virtual-xdp-kde")
+}
+
+pub fn list_kscreen_outputs() -> Vec<KscreenOutput> {
+    let out = std::process::Command::new("kscreen-doctor")
+        .arg("-o")
+        .env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {
+            parse_kscreen_outputs(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => Vec::new(),
+    }
+}
+
+pub fn select_tablet_output(outputs: &[KscreenOutput], preferred: Option<&str>) -> Option<String> {
+    let enabled: Vec<&str> = outputs
+        .iter()
+        .filter(|o| o.enabled)
+        .map(|o| o.name.as_str())
+        .collect();
+    if let Some(name) = preferred {
+        if enabled.contains(&name) {
+            return Some(name.to_string());
+        }
+    }
+    if let Some(name) = enabled
+        .iter()
+        .copied()
+        .find(|n| n.starts_with("Virtual-ORBISCREEN-"))
+    {
+        return Some(name.to_string());
+    }
+    if enabled.contains(&VIRTUAL_OUTPUT_CONNECTOR) {
+        return Some(VIRTUAL_OUTPUT_CONNECTOR.to_string());
+    }
+    enabled
+        .iter()
+        .copied()
+        .find(|n| {
+            n.starts_with(orbiscreen_core::output::CLIENT_CONNECTOR_PREFIX)
+                || n.starts_with("Virtual-OrbiScreen")
+                || n.starts_with("Virtual-orbi")
+        })
+        .map(str::to_string)
+}
+
+pub fn output_uuid(name: &str) -> Option<String> {
+    list_kscreen_outputs()
+        .into_iter()
+        .find(|o| o.enabled && o.name == name)
+        .and_then(|o| o.uuid)
+}
+
+pub fn preferred_tablet_output(preferred: Option<&str>) -> Option<String> {
+    select_tablet_output(&list_kscreen_outputs(), preferred)
+}
+
+pub fn disable_stale_portal_virtual_outputs() {
+    for output in list_kscreen_outputs() {
+        if output.enabled && is_portal_virtual_output(&output.name) {
+            let spec = format!("output.{}.disable", output.name);
+            match std::process::Command::new("kscreen-doctor")
+                .arg(&spec)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+            {
+                Ok(status) if status.success() => tracing::info!(
+                    output = %output.name,
+                    "disabled portal virtual output"
+                ),
+                Ok(status) => tracing::warn!(
+                    output = %output.name,
+                    %status,
+                    "kscreen-doctor failed to disable portal virtual output"
+                ),
+                Err(e) => tracing::warn!(
+                    output = %output.name,
+                    "could not run kscreen-doctor to disable portal virtual output: {e}"
+                ),
+            }
+        }
+    }
+}
+
+fn client_executable() -> std::io::Result<PathBuf> {
+    if let Some(appimage) = std::env::var_os("APPIMAGE")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty() && p.is_file())
+    {
+        return Ok(appimage);
+    }
+    std::env::current_exe().map_err(|e| std::io::Error::other(format!("resolve current exe: {e}")))
+}
+
+fn ensure_kwin_permission_file() {
+    let write = |path: &Path, exe: &str| -> std::io::Result<()> {
+        atomic_write(
+            path,
+            &format!(
+                "[Desktop Entry]\n\
+                 Exec={exe}\n\
+                 {KWIN_INTERFACES_KEY}\n\
+                 Type=Application\n\
+                 Name=Orbiscreen KWin screencast permission\n\
+                 Comment=Allows the Orbiscreen daemon to create virtual displays\n\
+                 NoDisplay=true\n"
+            ),
+        )
+    };
+
+    let Ok(exe) = client_executable() else {
+        tracing::warn!("could not resolve the daemon executable for the KWin permission file");
+        return;
+    };
+    let exe = match exe.to_str() {
+        Some(exe) => exe,
+        None => {
+            tracing::warn!(
+                "daemon executable path is not valid UTF-8; skipping KWin permission file"
+            );
+            return;
+        }
+    };
+
+    let Some(apps_dir) = user_applications_dir() else {
+        tracing::warn!(
+            "cannot determine a user applications directory (set HOME or XDG_DATA_HOME); \
+             KWin may not advertise the screencast protocol"
+        );
+        return;
+    };
+    let permission_file = apps_dir.join(PERMISSION_FILE_NAME);
+    if permission_file_matches(&permission_file, exe) {
+        return;
+    }
+    match write(&permission_file, exe) {
+        Ok(()) => tracing::info!(
+            file = %permission_file.display(),
+            "granted KWin screencast access via user desktop file"
+        ),
+        Err(e) => {
+            tracing::warn!("could not write the KWin permission file: {e}");
+            return;
+        }
+    }
+
+    for candidate in ["/usr/bin/kbuildsycoca6", "/usr/local/bin/kbuildsycoca6"] {
+        if Path::new(candidate).is_file() {
+            let _ = std::process::Command::new(candidate)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            break;
+        }
+    }
+}
+
+#[allow(missing_debug_implementations)]
+pub struct KwinVirtualCapture {
+    stream: ZkdeScreencastStreamUnstableV1,
+    pipewire: PipewireCapture,
+    width: u32,
+    height: u32,
+    connector: String,
+    stop: Arc<AtomicBool>,
+    ended: Arc<AtomicBool>,
+    event_thread: Option<std::thread::JoinHandle<()>>,
+    _damage_pump: super::damage_pump::DamagePumpHandle,
+}
+
+impl KwinVirtualCapture {
+    #[instrument(skip_all, fields(width = spec.width, height = spec.height))]
+    pub fn open(spec: KwinVirtualSpec) -> Result<Self, KwinVirtualError> {
+        let names = if spec.names.is_empty() {
+            orbiscreen_core::output::default_protocol_names()
+        } else {
+            spec.names.clone()
+        };
+        let description = if spec.description.is_empty() {
+            "Orbiscreen Virtual Display".to_string()
+        } else {
+            spec.description.clone()
+        };
+
+        if spec.names.is_empty() {
+            if let Some(path) = kwin_output_config_path() {
+                for name in &names {
+                    let connector = orbiscreen_core::output::connector_for(name);
+                    match forget_saved_virtual_output(&path, &connector) {
+                        Ok(true) => tracing::info!(
+                            file = %path.display(),
+                            connector,
+                            "cleared stale KWin config"
+                        ),
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!(
+                            file = %path.display(),
+                            connector,
+                            "could not clear stale KWin virtual output config: {e}"
+                        ),
+                    }
+                }
+            }
+        }
+        let Ok(width) = i32::try_from(spec.width) else {
+            return Err(KwinVirtualError::UnsupportedSize(spec.width, spec.height));
+        };
+        let Ok(height) = i32::try_from(spec.height) else {
+            return Err(KwinVirtualError::UnsupportedSize(spec.width, spec.height));
+        };
+        let mut session = WaylandSession::connect()?;
+        if session.state.screencast_global.is_none() && is_kde_session() {
+            ensure_kwin_permission_file();
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(500));
+                session = WaylandSession::connect()?;
+                if session.state.screencast_global.is_some() {
+                    break;
+                }
+            }
+        }
+        if session.state.screencast_global.is_none() {
+            return Err(KwinVirtualError::ProtocolUnavailable);
+        }
+
+        let (global_name, advertised_version) = session
+            .state
+            .screencast_global
+            .ok_or(KwinVirtualError::ProtocolUnavailable)?;
+
+        let client_max = <ZkdeScreencastUnstableV1 as Proxy>::interface().version;
+        let version = advertised_version.min(client_max);
+        if version < 2 {
+            return Err(KwinVirtualError::ProtocolTooOld);
+        }
+        let registry = session
+            .state
+            .registry
+            .clone()
+            .ok_or(KwinVirtualError::ProtocolUnavailable)?;
+        let screencast: ZkdeScreencastUnstableV1 =
+            registry.bind(global_name, version, &session.queue.handle(), ());
+
+        let mut last_err: Option<KwinVirtualError> = None;
+        let mut stream = None;
+        let mut node_id = None;
+        let mut shared_ok: Option<Arc<StreamShared>> = None;
+        let mut accepted_name: Option<String> = None;
+        let taken: Vec<String> = list_kscreen_outputs()
+            .into_iter()
+            .filter(|o| o.enabled)
+            .map(|o| o.name)
+            .collect();
+        for name in names {
+            let connector = orbiscreen_core::output::connector_for(&name);
+            if taken
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&connector))
+            {
+                tracing::info!(connector, "skipping in-use KWin connector");
+                continue;
+            }
+            let shared = Arc::new(StreamShared::default());
+            let candidate = if version >= 4 {
+                screencast.stream_virtual_output_with_description(
+                    name.clone(),
+                    description.clone(),
+                    width,
+                    height,
+                    1.0,
+                    POINTER_EMBEDDED,
+                    &session.queue.handle(),
+                    shared.clone(),
+                )
+            } else {
+                screencast.stream_virtual_output(
+                    name.clone(),
+                    width,
+                    height,
+                    1.0,
+                    POINTER_EMBEDDED,
+                    &session.queue.handle(),
+                    shared.clone(),
+                )
+            };
+
+            let deadline = Instant::now() + HANDSHAKE_DEADLINE;
+            let result = loop {
+                session
+                    .queue
+                    .roundtrip(&mut session.state)
+                    .map_err(|e| KwinVirtualError::Wayland(e.to_string()))?;
+                if let Some(err) = shared
+                    .failed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                {
+                    break Err(KwinVirtualError::StreamFailed(err));
+                }
+                if shared.closed.load(Ordering::Relaxed) {
+                    break Err(KwinVirtualError::StreamFailed(
+                        "compositor closed the stream during setup".into(),
+                    ));
+                }
+                if let Some(node) = *shared.node_id.lock().unwrap_or_else(|e| e.into_inner()) {
+                    break Ok(node);
+                }
+                if Instant::now() >= deadline {
+                    break Err(KwinVirtualError::Timeout);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            match result {
+                Ok(id) => {
+                    tracing::info!(name, "KWin virtual display created via zkde-screencast");
+                    stream = Some(candidate);
+                    node_id = Some(id);
+                    shared_ok = Some(shared);
+                    accepted_name = Some(orbiscreen_core::output::connector_for(&name));
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(name, "KWin virtual output '{name}' failed: {e}");
+                    drop(candidate);
+                    last_err = Some(e);
+                }
+            }
+        }
+        let (stream, node_id, shared) = match (stream, node_id, shared_ok) {
+            (Some(stream), Some(node_id), Some(shared)) => (stream, node_id, shared),
+            _ => {
+                return Err(last_err.unwrap_or_else(|| {
+                    KwinVirtualError::StreamFailed("no virtual output".into())
+                }));
+            }
+        };
+
+        let pipewire = PipewireCapture::open(PipewireSpec {
+            fd: None,
+            node_id,
+            width: spec.width,
+            height: spec.height,
+        })
+        .map_err(KwinVirtualError::Wayland)?;
+
+        let pump_interval =
+            Duration::from_nanos(1_000_000_000u64 / u64::from(spec.refresh_hz.max(1)));
+        let hint = accepted_name
+            .clone()
+            .unwrap_or_else(|| VIRTUAL_OUTPUT_CONNECTOR.to_string());
+        let damage_pump = super::damage_pump::spawn(pump_interval, &hint);
+
+        let ended = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let event_thread = std::thread::Builder::new()
+            .name("orbiscreen-kwin-events".into())
+            .spawn({
+                let shared = Arc::clone(&shared);
+                let ended = Arc::clone(&ended);
+                let stop = Arc::clone(&stop);
+                move || {
+                    pump_events(
+                        session.conn,
+                        session.queue,
+                        session.state,
+                        shared,
+                        stop,
+                        ended,
+                    )
+                }
+            })
+            .map_err(|e| KwinVirtualError::Wayland(format!("spawn event thread: {e}")))?;
+
+        Ok(Self {
+            stream,
+            pipewire,
+            width: spec.width,
+            height: spec.height,
+            connector: accepted_name.unwrap_or_else(|| VIRTUAL_OUTPUT_CONNECTOR.to_string()),
+            stop,
+            ended,
+            event_thread: Some(event_thread),
+            _damage_pump: damage_pump,
+        })
+    }
+
+    pub fn connector_name(&self) -> &str {
+        &self.connector
+    }
+
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    pub fn is_ended(&self) -> bool {
+        self.ended.load(Ordering::Relaxed)
+    }
+
+    pub async fn next_frame(&self) -> Result<CapturedFrame, CaptureError> {
+        if self.ended.load(Ordering::Relaxed) {
+            return Err(CaptureError::Io(
+                "KWin virtual output stream was closed".into(),
+            ));
+        }
+        match self.pipewire.next_frame().await {
+            Ok(frame) => Ok(frame),
+            Err(_e) if self.ended.load(Ordering::Relaxed) => Err(CaptureError::Io(
+                "KWin virtual output stream was closed".into(),
+            )),
+            Err(e) => Err(CaptureError::Io(e)),
+        }
+    }
+}
+
+impl Drop for KwinVirtualCapture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+
+        self.stream.close();
+        if let Some(handle) = self.event_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+fn pump_events(
+    conn: Connection,
+    mut queue: EventQueue<HandshakeState>,
+    mut state: HandshakeState,
+    shared: Arc<StreamShared>,
+    stop: Arc<AtomicBool>,
+    ended: Arc<AtomicBool>,
+) {
+    loop {
+        if stop.load(Ordering::Relaxed) || shared.closed.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Err(e) = queue.dispatch_pending(&mut state) {
+            tracing::warn!("kwin event dispatch failed: {e}");
+            break;
+        }
+        if stop.load(Ordering::Relaxed) || shared.closed.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let _ = conn.flush();
+        let Some(guard) = conn.prepare_read() else {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        let fd = guard.connection_fd().as_raw_fd();
+        let mut fds = [libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, EVENT_POLL_TIMEOUT_MS) };
+        if ready > 0 && fds[0].revents & libc::POLLIN != 0 {
+            if let Err(e) = guard.read() {
+                let would_block = matches!(&e, WaylandError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock);
+                if !would_block {
+                    tracing::warn!("kwin read_events failed: {e}");
+                    break;
+                }
+            }
+        }
+    }
+    ended.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forget_saved_virtual_output_drops_connector() {
+        let dir = std::env::temp_dir().join(format!("orbi-kwin-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kwinoutputconfig.json");
+        std::fs::write(
+            &path,
+            r#"[{
+                "data": [
+                    {"connectorName": "eDP-1"},
+                    {"connectorName": "Virtual-ORBISCREEN", "uuid": "dead"}
+                ]
+            }]"#,
+        )
+        .unwrap();
+        assert!(forget_saved_virtual_output(&path, VIRTUAL_OUTPUT_CONNECTOR).unwrap());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("Virtual-ORBISCREEN"));
+        assert!(raw.contains("eDP-1"));
+        assert!(!forget_saved_virtual_output(&path, VIRTUAL_OUTPUT_CONNECTOR).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_kscreen_doctor_outputs_without_disable_capability() {
+        let text = "\
+\u{1b}[01;32mOutput: \u{1b}[0;0m1 Virtual-Orbi-9d41ad1e 176a146e-5197-4e7d-9630-984a72a2ca0c
+\t\u{1b}[01;33mdisable unsupported\u{1b}[0;0m
+\t\u{1b}[01;32mconnected\u{1b}[0;0m
+\t\u{1b}[01;32mpriority 3\u{1b}[0;0m
+\tGeometry: 3360,0 1920x1200
+Output: 2 DP-1 3356e458-e8d2-4a69-9e9f-2cfde533f035
+\tdisable unsupported
+\tconnected
+\tGeometry: 0,0 1920x1080
+Output: 3 HDMI-A-1 720ddf38-49b9-4d4c-bb53-5c965c3052f5
+\tdisable unsupported
+\tconnected
+\tGeometry: 1920,0 1440x900
+";
+        let outs = parse_kscreen_outputs(text);
+        assert_eq!(outs.len(), 3);
+        assert!(outs.iter().all(|o| o.enabled));
+        assert_eq!(outs[0].geometry, Some((3360, 0, 1920, 1200)));
+        let max_x = outs
+            .iter()
+            .filter(|o| o.name != "Virtual-Orbi-9d41ad1e")
+            .filter_map(|o| o.geometry)
+            .map(|(x, _, w, _)| x + w as i32)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(max_x, 3360);
+    }
+
+    #[test]
+    fn parse_kscreen_doctor_outputs() {
+        let text = "\
+\u{1b}[01;32mOutput: \u{1b}[0;0m1 eDP-1 8d4cd7b2-4072-46fe-9076-a472ff599d3e
+\u{1b}[01;32menabled\u{1b}[0;0m
+connected
+Geometry: 0,0 1920x1200
+Output: 2 DP-6 2185e147-5700-4a76-95c7-4ca01c705bea
+enabled
+Geometry: 1920,0 2560x1440
+Output: 3 Virtual-virtual-xdp-kde- 3ab51ad6-f454-4c80-bee1-bb69124801de
+enabled
+Geometry: 4480,0 1920x1080
+Output: 4 Virtual-ORBISCREEN deadbeef-0000-0000-0000-000000000000
+disabled
+";
+        let outs = parse_kscreen_outputs(text);
+        assert_eq!(
+            outs,
+            vec![
+                KscreenOutput {
+                    name: "eDP-1".into(),
+                    uuid: Some("8d4cd7b2-4072-46fe-9076-a472ff599d3e".into()),
+                    enabled: true,
+                    geometry: Some((0, 0, 1920, 1200)),
+                },
+                KscreenOutput {
+                    name: "DP-6".into(),
+                    uuid: Some("2185e147-5700-4a76-95c7-4ca01c705bea".into()),
+                    enabled: true,
+                    geometry: Some((1920, 0, 2560, 1440)),
+                },
+                KscreenOutput {
+                    name: "Virtual-virtual-xdp-kde-".into(),
+                    uuid: Some("3ab51ad6-f454-4c80-bee1-bb69124801de".into()),
+                    enabled: true,
+                    geometry: Some((4480, 0, 1920, 1080)),
+                },
+                KscreenOutput {
+                    name: "Virtual-ORBISCREEN".into(),
+                    uuid: Some("deadbeef-0000-0000-0000-000000000000".into()),
+                    enabled: false,
+                    geometry: None,
+                },
+            ]
+        );
+        let max_x = outs
+            .iter()
+            .filter(|o| o.enabled && o.name != "Virtual-ORBISCREEN")
+            .filter_map(|o| o.geometry)
+            .map(|(x, _, w, _)| x + w as i32)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(max_x, 6400);
+        assert_eq!(
+            select_tablet_output(&outs, Some(VIRTUAL_OUTPUT_CONNECTOR)).as_deref(),
+            None
+        );
+        let mut with_orbi = outs.clone();
+        with_orbi[3].enabled = true;
+        assert_eq!(
+            select_tablet_output(&with_orbi, Some(VIRTUAL_OUTPUT_CONNECTOR)).as_deref(),
+            Some(VIRTUAL_OUTPUT_CONNECTOR)
+        );
+        with_orbi.push(KscreenOutput {
+            name: "Virtual-ORBISCREEN-123".into(),
+            uuid: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
+            enabled: true,
+            geometry: None,
+        });
+        assert_eq!(
+            select_tablet_output(&with_orbi, Some("Virtual-ORBISCREEN-123")).as_deref(),
+            Some("Virtual-ORBISCREEN-123")
+        );
+        assert_eq!(
+            select_tablet_output(&with_orbi, Some(VIRTUAL_OUTPUT_CONNECTOR)).as_deref(),
+            Some(VIRTUAL_OUTPUT_CONNECTOR)
+        );
+        assert_eq!(
+            select_tablet_output(&with_orbi, None).as_deref(),
+            Some("Virtual-ORBISCREEN-123")
+        );
+    }
+
+    #[test]
+    fn pointer_frame_offsets_the_output_within_the_workspace() {
+        let text = "
+Output: 1 eDP-1 8d4cd7b2-4072-46fe-9076-a472ff599d3e
+enabled
+Geometry: 0,0 1920x1200
+Output: 2 DP-6 2185e147-5700-4a76-95c7-4ca01c705bea
+enabled
+Geometry: 1920,0 2560x1440
+Output: 3 Virtual-Orbi-1234 3ab51ad6-f454-4c80-bee1-bb69124801de
+enabled
+Geometry: 4480,0 2560x1600
+";
+        let outs = parse_kscreen_outputs(text);
+        assert_eq!(
+            pointer_frame_from(&outs, "Virtual-Orbi-1234", 2560, 1600),
+            Some((4480, 0, 7040, 1600))
+        );
+        assert_eq!(
+            pointer_frame_from(&outs, "DP-6", 2560, 1440),
+            Some((1920, 0, 7040, 1600))
+        );
+        assert_eq!(
+            pointer_frame_from(&outs, "Virtual-Orbi-1234", 0, 1600),
+            None
+        );
+    }
+
+    #[test]
+    fn pointer_frame_falls_back_to_the_right_edge_when_unplaced() {
+        let text = "
+Output: 1 eDP-1 8d4cd7b2-4072-46fe-9076-a472ff599d3e
+enabled
+Geometry: 0,0 1920x1200
+";
+        let outs = parse_kscreen_outputs(text);
+        assert_eq!(
+            pointer_frame_from(&outs, "Virtual-Orbi-9999", 2560, 1600),
+            Some((1920, 0, 4480, 1600))
+        );
+    }
+}

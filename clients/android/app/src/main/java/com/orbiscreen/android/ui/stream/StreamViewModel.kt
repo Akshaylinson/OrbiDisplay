@@ -1,0 +1,778 @@
+package com.orbiscreen.android.ui.stream
+
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.orbiscreen.android.data.PrefsStore
+import com.orbiscreen.android.input.InputDispatcher
+import com.orbiscreen.android.net.HostApi
+import com.orbiscreen.android.player.IdrRequester
+import com.orbiscreen.android.player.PlayerHolder
+import com.orbiscreen.android.player.StreamEvent
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.withContext
+
+private const val TOKEN_REFRESH_INTERVAL_MS = 30_000L
+
+private const val CONNECT_TIMEOUT_MS = 45_000L
+
+private const val GEOMETRY_POLL_INTERVAL_MS = 5_000L
+private const val IDR_RETRY_INTERVAL_MS = 1_000L
+
+enum class LoginStage { Checking, ConfirmFingerprint, Pending, Failed, Ready }
+
+data class LoginState(
+    val stage: LoginStage = LoginStage.Checking,
+    val fingerprint: String = "",
+    val message: String = "Connecting securely to host…",
+    val saved: Boolean = false,
+    val changed: Boolean = false,
+)
+
+enum class PairedLoginStep { Connect, Expired, Reconfirm }
+
+internal fun pairedLoginStep(savedFingerprint: String, live: HostApi.ObservedCertificate): PairedLoginStep = when {
+    !live.validNow -> PairedLoginStep.Expired
+    live.fingerprint != savedFingerprint -> PairedLoginStep.Reconfirm
+    else -> PairedLoginStep.Connect
+}
+
+internal const val HOST_CERT_EXPIRED_MESSAGE =
+    "The host's certificate has expired. Restart Orbiscreen on the host (it issues a new one), then retry."
+
+internal fun resolveSelectedResolution(
+    preset: String,
+    nativeW: Int,
+    nativeH: Int,
+): Pair<Int, Int> {
+    val (w, h) = when {
+        preset == "720p" -> 1280 to 720
+        preset == "1080p" -> 1920 to 1080
+        preset == "1440p" -> 2560 to 1440
+        preset == "2k" -> 2560 to 1600
+        preset.startsWith("custom_") -> {
+            val parts = preset.removePrefix("custom_").split("x")
+            if (parts.size == 2) {
+                (parts[0].toIntOrNull() ?: nativeW) to (parts[1].toIntOrNull() ?: nativeH)
+            } else {
+                nativeW to nativeH
+            }
+        }
+        else -> nativeW to nativeH
+    }
+    if (w <= 0 || h <= 0) {
+        return if (nativeW > 0 && nativeH > 0) {
+            maxOf(nativeW, nativeH) to minOf(nativeW, nativeH)
+        } else {
+            DEFAULT_STREAM_W to DEFAULT_STREAM_H
+        }
+    }
+    return maxOf(w, h) to minOf(w, h)
+}
+
+internal const val DEFAULT_STREAM_W = 1920
+internal const val DEFAULT_STREAM_H = 1080
+
+data class StreamState(
+    val host: String,
+    val port: Int,
+    val event: StreamEvent = StreamEvent.Idle,
+    val displayWidth: Int = 1920,
+    val displayHeight: Int = 1080,
+    val keyboardVisible: Boolean = false,
+    val scaleMode: Int = 0,
+    val resolutionLabel: String = "1920x1080",
+    val notice: String? = null,
+)
+
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+class StreamViewModel(
+    private val context: Context,
+    private val prefs: PrefsStore,
+    val host: String,
+    val port: Int,
+) : ViewModel() {
+
+    private val hostApi = HostApi()
+    private val credentialStore = com.orbiscreen.android.data.HostCredentialStore(context)
+    private val isLan = !com.orbiscreen.android.net.HostSpec.isLoopback(host)
+    private val healthHttp: okhttp3.OkHttpClient = okhttp3.OkHttpClient.Builder()
+        .connectTimeout(1000, java.util.concurrent.TimeUnit.MILLISECONDS)
+        .readTimeout(1000, java.util.concurrent.TimeUnit.MILLISECONDS)
+        .build()
+    private val _login = MutableStateFlow(LoginState())
+    val login: StateFlow<LoginState> = _login.asStateFlow()
+    private var loginJob: kotlinx.coroutines.Job? = null
+    private var proxy: com.orbiscreen.android.net.PinnedHostProxy? = null
+    private var transportHost = if (isLan) "127.0.0.1" else host
+    private var transportPort = if (isLan) 0 else port
+    private val holders = MutableStateFlow(PlayerHolder(context, prefs))
+    private val playerHolder get() = holders.value
+    private var inputDispatcher: InputDispatcher? = null
+    private val _inputGeneration = MutableStateFlow(0)
+
+    val inputGeneration: StateFlow<Int> = _inputGeneration.asStateFlow()
+    private var sessionToken: String? = null
+    private var displaySessionId: String? = null
+    private val idrRequester = IdrRequester()
+    private var waitingForKeyframe = false
+
+    private fun scaleModeFromPref(pref: String): Int = when (pref) {
+        "fill" -> 3
+        else -> 0
+    }
+
+    private val _state = MutableStateFlow(
+        StreamState(
+            host = host,
+            port = port,
+            event = StreamEvent.Connecting(android.net.Uri.parse("http://$host:$port/stream")),
+            scaleMode = scaleModeFromPref(prefs.scaleMode),
+        )
+    )
+    val state: StateFlow<StreamState> = _state.asStateFlow()
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val player = holders.flatMapLatest { it.player }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val udpPlayer = holders.flatMapLatest { it.udpPlayer }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val usbPlayer = holders.flatMapLatest { it.usbPlayer }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
+    val streamStats get() = playerHolder.stats
+
+    fun detectNativeDisplay(): Triple<Int, Int, Int> {
+        val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as? android.view.WindowManager
+        val display = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            try {
+                context.display ?: windowManager?.defaultDisplay
+            } catch (_: Exception) {
+                windowManager?.defaultDisplay
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            windowManager?.defaultDisplay
+        }
+        val mode = display?.mode
+        val physW = mode?.physicalWidth ?: context.resources.displayMetrics.widthPixels
+        val physH = mode?.physicalHeight ?: context.resources.displayMetrics.heightPixels
+        val nativeW = maxOf(physW, physH)
+        val nativeH = minOf(physW, physH)
+        val refreshRate = run {
+            val hz = display?.supportedModes
+                ?.maxOfOrNull { it.refreshRate }
+                ?: mode?.refreshRate
+                ?: 60f
+            Math.round(hz).coerceIn(30, 240)
+        }
+        return Triple(nativeW, nativeH, refreshRate)
+    }
+
+    private fun hasLocalResolutionChoice(): Boolean {
+        val preset = prefs.resolutionPreset
+        return preset.isNotEmpty() && preset != "native"
+    }
+
+    private suspend fun refreshHostGeometry() {
+        val current = _state.value
+        val w = current.displayWidth
+        val h = current.displayHeight
+        if (w <= 0 || h <= 0) return
+        val info = withContext(Dispatchers.IO) {
+            runCatching { hostApi.info(transportHost, transportPort) }.getOrNull()
+        } ?: return
+        val hw = info.width
+        val hh = info.height
+        if (hw <= 0 || hh <= 0) return
+        if (hw == w && hh == h) return
+        if (hasLocalResolutionChoice()) return
+        val longEdge = maxOf(hw, hh)
+        val shortEdge = minOf(hw, hh)
+        _state.value = _state.value.copy(
+            displayWidth = longEdge,
+            displayHeight = shortEdge,
+            resolutionLabel = "${longEdge}x$shortEdge",
+        )
+    }
+
+    private fun clampToPanel(w: Int, h: Int): Pair<Int, Int> {
+        val (nativeW, nativeH, _) = detectNativeDisplay()
+        if (nativeW <= 0 || nativeH <= 0 || w <= 0 || h <= 0) return w to h
+        val longEdge = minOf(maxOf(w, h), nativeW)
+        val shortEdge = minOf(minOf(w, h), nativeH)
+        return maxOf(longEdge, shortEdge) to minOf(longEdge, shortEdge)
+    }
+
+    private fun selectedResolution(): Pair<Int, Int> {
+        val (nativeW, nativeH, _) = detectNativeDisplay()
+        val (w, h) = resolveSelectedResolution(prefs.resolutionPreset, nativeW, nativeH)
+        return clampToPanel(w, h)
+    }
+
+    private suspend fun waitForAoaProxy() {
+        if (!com.orbiscreen.android.net.HostSpec.isLoopback(host)) return
+        if (com.orbiscreen.android.usb.UsbAccessoryManager.isAoaActive) return
+        com.orbiscreen.android.usb.UsbAccessoryManager.init(context)
+        val deadline = android.os.SystemClock.elapsedRealtime() + 2_000L
+        while (!com.orbiscreen.android.usb.UsbAccessoryManager.isAoaActive &&
+            android.os.SystemClock.elapsedRealtime() < deadline
+        ) {
+            delay(50)
+        }
+    }
+
+    private suspend fun freshToken(forceRefresh: Boolean = false): String {
+        if (isLan) return proxy?.localToken.orEmpty()
+        return withContext(Dispatchers.IO) {
+            val current = sessionToken
+            if (!forceRefresh && !current.isNullOrBlank()) {
+                return@withContext current
+            }
+            val h = transportHost
+            val p = transportPort
+            for (attempt in 1..6) {
+                val t = hostApi.token(h, p)
+                if (!t.isNullOrBlank()) {
+                    sessionToken = t
+                    inputDispatcher?.updateToken(t)
+                    return@withContext t
+                }
+                if (attempt < 6) delay(250)
+            }
+            sessionToken.orEmpty()
+        }
+    }
+
+    init {
+        viewModelScope.launch {
+            holders.flatMapLatest { it.event }.collect { ev ->
+                _state.value = _state.value.copy(event = ev)
+                when (ev) {
+                    is StreamEvent.Playing -> waitingForKeyframe = false
+                    is StreamEvent.Error -> {
+                        waitingForKeyframe = true
+                        requestIdr()
+                    }
+                    is StreamEvent.Connecting, is StreamEvent.Buffering ->
+                        waitingForKeyframe = true
+                    is StreamEvent.Disconnected, is StreamEvent.Idle ->
+                        waitingForKeyframe = false
+                    else -> {}
+                }
+            }
+        }
+        viewModelScope.launch {
+            while (isActive) {
+                delay(IDR_RETRY_INTERVAL_MS)
+                if (waitingForKeyframe &&
+                    playerHolder.udpPlayer.value == null &&
+                    playerHolder.usbPlayer.value == null
+                ) {
+                    requestIdr()
+                }
+            }
+        }
+        beginLogin()
+        viewModelScope.launch {
+            _state.collect { s ->
+                inputDispatcher?.resize(s.displayWidth, s.displayHeight)
+            }
+        }
+        viewModelScope.launch {
+            launch {
+                while (isActive) {
+                    delay(GEOMETRY_POLL_INTERVAL_MS)
+                    refreshHostGeometry()
+                }
+            }
+            while (isActive && !isLan) {
+                delay(TOKEN_REFRESH_INTERVAL_MS)
+                freshToken(forceRefresh = true)
+            }
+        }
+        viewModelScope.launch {
+            holders.flatMapLatest { it.event }.collect { ev ->
+                if (ev is StreamEvent.Playing && isLan) {
+                    prefs.recentHost = com.orbiscreen.android.data.RecentHost(host = host, port = port)
+                }
+            }
+        }
+        viewModelScope.launch {
+            var healthFailures = 0
+            while (isActive) {
+                delay(2000)
+                if (_state.value.event !is StreamEvent.Playing || transportPort <= 0) {
+                    healthFailures = 0
+                    continue
+                }
+                val usbVideoActive = holders.value.usbPlayer.value != null
+                val alive = checkHostAlive(transportHost, transportPort)
+                healthFailures = if (alive) 0 else healthFailures + 1
+                if (HostWatch.shouldDisconnect(usbVideoActive, healthFailures)) {
+                    android.util.Log.w("StreamVM", "host unreachable while playing; triggering disconnect")
+                    healthFailures = 0
+                    playerHolder.release()
+                    _state.value = _state.value.copy(
+                        event = StreamEvent.Disconnected("Host daemon stopped or disconnected")
+                    )
+                }
+            }
+        }
+    }
+
+    fun beginLogin() {
+        loginJob?.cancel()
+        loginJob = viewModelScope.launch {
+            _login.value = LoginState()
+            try {
+                if (!isLan) {
+                    _login.value = LoginState(LoginStage.Ready)
+                    connectStream()
+                    return@launch
+                }
+                val saved = withContext(Dispatchers.IO) { credentialStore.load(host, port) }
+                if (saved != null) {
+                    _login.value = LoginState(saved = true)
+                    val live = hostApi.observeCertificate(host, port)
+                    when (pairedLoginStep(saved.fingerprint, live)) {
+                        PairedLoginStep.Connect -> connectPaired(saved)
+                        PairedLoginStep.Expired -> _login.value = LoginState(LoginStage.Failed, saved = true,
+                            message = HOST_CERT_EXPIRED_MESSAGE)
+                        PairedLoginStep.Reconfirm -> _login.value =
+                            LoginState(LoginStage.ConfirmFingerprint, live.fingerprint, saved = true, changed = true)
+                    }
+                } else {
+                    val pin = hostApi.certificateFingerprint(host, port)
+                    _login.value = LoginState(LoginStage.ConfirmFingerprint, pin)
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                android.util.Log.w("OrbiLogin", "login failed: ${e.message}", e)
+                _login.value = _login.value.copy(stage = LoginStage.Failed,
+                    message = "Secure connection failed. Check host address, TLS port, and certificate. If the host was reinstalled, forget its saved login and verify the new fingerprint.")
+            }
+        }
+    }
+
+    fun confirmFingerprint() {
+        val confirming = _login.value.takeIf { it.stage == LoginStage.ConfirmFingerprint } ?: return
+        val pin = confirming.fingerprint
+        loginJob?.cancel()
+        loginJob = viewModelScope.launch {
+            if (confirming.changed) {
+                _login.value = LoginState(LoginStage.Pending, pin, "Checking the saved login against the new certificate…", saved = true)
+                try {
+                    val saved = withContext(Dispatchers.IO) { credentialStore.load(host, port) }
+                    if (saved != null && hostApi.credentialAccepted(host, port, pin, saved.credential)) {
+                        val updated = saved.copy(fingerprint = pin)
+                        withContext(Dispatchers.IO) { credentialStore.save(host, port, updated) }
+                        connectPaired(updated)
+                        return@launch
+                    }
+                    withContext(Dispatchers.IO) { credentialStore.forget(host, port) }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    android.util.Log.w("OrbiLogin", "saved login check failed: ${e.message}", e)
+                    _login.value = LoginState(LoginStage.Failed, pin, saved = true,
+                        message = "Could not check the saved login against the host's new certificate. Retry, or forget the saved login and pair again.")
+                    return@launch
+                }
+            }
+            _login.value = LoginState(LoginStage.Pending, pin, "Approve this device on the host.")
+            try {
+                val name = com.orbiscreen.android.net.ClientIdentity.from(context).name
+                val id = hostApi.requestPairing(host, port, pin, name)
+                repeat(150) {
+                    delay(2000)
+                    val status = hostApi.pairingStatus(host, port, pin, id)
+                    when (status.status) {
+                        "approved" -> {
+                            val saved = com.orbiscreen.android.data.HostCredential(pin, requireNotNull(status.credential))
+                            withContext(Dispatchers.IO) { credentialStore.save(host, port, saved) }
+                            _login.value = _login.value.copy(saved = true)
+                            connectPaired(saved)
+                            return@launch
+                        }
+                        "unknown" -> error("Pairing expired or denied")
+                    }
+                }
+                error("Pairing timed out")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                android.util.Log.w("OrbiLogin", "pairing failed: ${e.message}", e)
+                _login.value = _login.value.copy(stage = LoginStage.Failed,
+                    message = "Pairing failed, expired, or was denied. Retry and approve on the host. If approval was already claimed, request pairing again.")
+            }
+        }
+    }
+
+    fun forgetLogin() {
+        loginJob?.cancel()
+        loginJob = viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { credentialStore.forget(host, port) }
+                resetTransport()
+                beginLogin()
+            } catch (_: Exception) {
+                _login.value = LoginState(LoginStage.Failed, message = "Could not remove saved login.")
+            }
+        }
+    }
+
+    private suspend fun connectPaired(saved: com.orbiscreen.android.data.HostCredential) {
+        resetTransport()
+        proxy = withContext(Dispatchers.IO) {
+            com.orbiscreen.android.net.PinnedHostProxy(host, port, saved.fingerprint, saved.credential) {
+                viewModelScope.launch {
+                    resetTransport()
+                    _login.value = LoginState(LoginStage.Failed, saved = true,
+                        message = "Host rejected this login. Forget the saved login and request approval again.")
+                }
+            }
+        }
+        transportPort = requireNotNull(proxy).port
+        sessionToken = requireNotNull(proxy).localToken
+        connectStream()
+        _login.value = LoginState(LoginStage.Ready, saved = true)
+    }
+
+    private fun resetTransport() {
+        playerHolder.release()
+        holders.value = PlayerHolder(context, prefs)
+        waitingForKeyframe = false
+        inputDispatcher?.release()
+        inputDispatcher = null
+        _inputGeneration.value += 1
+        proxy?.close()
+        proxy = null
+        sessionToken = null
+        displaySessionId = null
+    }
+
+    private suspend fun connectStream() {
+            if (!isLan) {
+                waitForAoaProxy()
+                if (com.orbiscreen.android.usb.UsbAccessoryManager.isAoaActive) {
+                    val p = com.orbiscreen.android.usb.UsbAccessoryManager.localProxyPort
+                    if (p in 1..65535) {
+                        transportHost = "127.0.0.1"
+                        transportPort = p
+                    }
+                }
+            }
+            val info = withContext(Dispatchers.IO) {
+                var t: String? = null
+                var retries = 0
+                while (t.isNullOrBlank() && retries < 6) {
+                    t = freshToken()
+                    if (!t.isNullOrBlank()) break
+                    delay(250)
+                    retries++
+                }
+                val i = hostApi.info(transportHost, transportPort)
+                t to i
+            }
+            sessionToken = info.first
+            info.first?.let { inputDispatcher?.updateToken(it) }
+            val token = info.first.orEmpty()
+            val (requestedW, requestedH) = selectedResolution()
+            val identity = com.orbiscreen.android.net.ClientIdentity.from(
+                context,
+                requestedW,
+                requestedH,
+            )
+            val session = if (token.isNotBlank()) {
+                hostApi.openSession(transportHost, transportPort, token, identity)
+            } else {
+                null
+            }
+            if (isLan && session == null) {
+                android.util.Log.w(
+                    "OrbiLogin",
+                    "no per-client display session from host; using the default display",
+                )
+            }
+            displaySessionId = session?.id
+            inputDispatcher?.sessionId = session?.id
+            val hostInfo = info.second
+            if (!isLan && session == null) {
+                _state.value = _state.value.copy(
+                    event = StreamEvent.Error(-4, "USB session failed"),
+                )
+                return
+            }
+            val (targetW, targetH) = selectedResolution()
+            val w = session?.width?.takeIf { it > 0 }
+                ?: targetW.takeIf { it > 0 }
+                ?: hostInfo?.width
+                ?: identity.width
+            val h = session?.height?.takeIf { it > 0 }
+                ?: targetH.takeIf { it > 0 }
+                ?: hostInfo?.height
+                ?: identity.height
+            _state.value = _state.value.copy(
+                displayWidth = w,
+                displayHeight = h,
+                resolutionLabel = "${w}x${h}",
+            )
+            inputDispatcher?.resize(
+                _state.value.displayWidth,
+                _state.value.displayHeight,
+            )
+            playerHolder.refreshSession = { reopenDisplaySession() }
+            playerHolder.onResolutionFallback = { w, h -> updateDimensions(w, h) }
+            playerHolder.udpKeyIssuer = { opened ->
+                if (!isLan) {
+                    null
+                } else {
+                    val fresh = freshToken()
+                    val issued = withContext(Dispatchers.IO) {
+                        hostApi.issueUdpKey(transportHost, transportPort, fresh, opened.id)
+                    }
+                    if (issued == null) {
+                        android.util.Log.w("StreamVM", "UDP key was not issued on session refresh")
+                        null
+                    } else {
+                        com.orbiscreen.android.player.UdpVideoTarget(
+                            host = host,
+                            port = issued.udpPort,
+                            keyId = issued.keyId,
+                            secret = issued.secret,
+                            sessionId = opened.id,
+                            httpHost = transportHost,
+                            httpPort = transportPort,
+                        )
+                    }
+                }
+            }
+            val udpTarget = if (isLan && session != null && token.isNotBlank()) {
+                val issued = withContext(Dispatchers.IO) {
+                    hostApi.issueUdpKey(transportHost, transportPort, token, session.id)
+                }
+                if (issued == null) {
+                    android.util.Log.w("StreamVM", "UDP key was not issued; using MPEG-TS")
+                    null
+                } else {
+                    com.orbiscreen.android.player.UdpVideoTarget(
+                        host = host,
+                        port = issued.udpPort,
+                        keyId = issued.keyId,
+                        secret = issued.secret,
+                        sessionId = session.id,
+                        httpHost = transportHost,
+                        httpPort = transportPort,
+                    )
+                }
+            } else {
+                null
+            }
+            playerHolder.build(
+                transportHost,
+                transportPort,
+                session,
+                tokenProvider = { freshToken() },
+                udp = udpTarget,
+            )
+    }
+
+    private fun requestIdr() {
+        if (isLan && (proxy == null || displaySessionId == null)) return
+        waitingForKeyframe = true
+        val udp = playerHolder.udpPlayer.value
+        if (udp != null) {
+            udp.requestIdr()
+            return
+        }
+        val usb = playerHolder.usbPlayer.value
+        if (usb != null) {
+            usb.requestIdr()
+            return
+        }
+        idrRequester.request { ensureInput().control("idr") }
+    }
+
+    fun ensureInput(): InputDispatcher {
+        val dispatcher = inputDispatcher ?: InputDispatcher(
+            host = transportHost,
+            port = transportPort,
+            displayWidth = state.value.displayWidth,
+            displayHeight = state.value.displayHeight,
+            token = sessionToken ?: "",
+            tokenProvider = { sessionToken ?: "" },
+            sessionIdProvider = { displaySessionId },
+        ).also {
+            it.pointerSpeed = prefs.pointerSpeed
+            it.onUnauthorized = {
+                viewModelScope.launch { freshToken(forceRefresh = true) }
+            }
+            inputDispatcher = it
+        }
+        
+        dispatcher.sessionId = displaySessionId
+        sessionToken?.let { dispatcher.updateToken(it) }
+        dispatcher.resize(state.value.displayWidth, state.value.displayHeight)
+        return dispatcher
+    }
+
+    val pointerSpeed: Float
+        get() = prefs.pointerSpeed
+
+    fun setPointerSpeed(speed: Float) {
+        prefs.pointerSpeed = speed
+        inputDispatcher?.pointerSpeed = speed
+    }
+
+    fun disconnect() {
+        loginJob?.cancel()
+        val id = displaySessionId
+        val token = sessionToken
+        val closingProxy = proxy
+        proxy = null
+        displaySessionId = null
+        sessionToken = null
+        waitingForKeyframe = false
+        inputDispatcher?.release()
+        inputDispatcher = null
+        playerHolder.release()
+        val closingHost = transportHost
+        val closingPort = transportPort
+        viewModelScope.launch {
+            try {
+                if (!id.isNullOrBlank() && !token.isNullOrBlank()) {
+                    hostApi.closeSession(closingHost, closingPort, token, id)
+                }
+            } finally {
+                closingProxy?.close()
+            }
+        }
+    }
+
+    private suspend fun reopenDisplaySession(): com.orbiscreen.android.net.HostApi.SessionInfo? {
+        val token = freshToken(forceRefresh = true)
+        val (requestedW, requestedH) = selectedResolution()
+        val identity = com.orbiscreen.android.net.ClientIdentity.from(
+            context,
+            requestedW,
+            requestedH,
+        )
+        val session = if (token.isNotBlank()) {
+            hostApi.openSession(transportHost, transportPort, token, identity)
+        } else {
+            null
+        }
+        displaySessionId = session?.id
+        inputDispatcher?.sessionId = session?.id
+        if (session != null) {
+            _state.value = _state.value.copy(
+                displayWidth = session.width,
+                displayHeight = session.height,
+                resolutionLabel = "${session.width}x${session.height}",
+            )
+            inputDispatcher?.resize(session.width, session.height)
+        }
+        return session
+    }
+
+    fun retry() = playerHolder.retry(transportHost, transportPort) { freshToken(forceRefresh = true) }
+
+    fun toggleKeyboard() {
+        _state.value = _state.value.copy(keyboardVisible = !_state.value.keyboardVisible)
+    }
+
+    fun lock() {
+        ensureInput().control("lock") { ok ->
+            if (!ok) {
+                _state.value = _state.value.copy(
+                    notice = "The host refused the lock request. Over USB, host desktop actions " +
+                        "need the session token from the host's start banner."
+                )
+            }
+        }
+    }
+
+    fun dismissNotice() {
+        _state.value = _state.value.copy(notice = null)
+    }
+
+    fun setScaleMode(mode: Int) {
+        _state.value = _state.value.copy(scaleMode = mode)
+    }
+
+    fun setScaleModeByKey(key: String) {
+        prefs.scaleMode = key
+        _state.value = _state.value.copy(scaleMode = scaleModeFromPref(key))
+    }
+
+    fun setResolutionPreset(preset: String, w: Int, h: Int) {
+        prefs.resolutionPreset = preset
+        val (targetW, targetH) = selectedResolution()
+        updateDimensions(targetW, targetH, if (preset == "native") "Native" else "${targetW}x${targetH}")
+    }
+
+    fun updateDimensions(w: Int, h: Int, label: String = "${w}x${h}", fps: Int = detectNativeDisplay().third) {
+        if (w > 0 && h > 0) {
+            val (clampedW, clampedH) = clampToPanel(w, h)
+            val requested = maxOf(w, h) to minOf(w, h)
+            val finalLabel =
+                if (clampedW to clampedH == requested) label else "${clampedW}x${clampedH}"
+            prefs.resolutionPreset = "custom_${clampedW}x$clampedH"
+            _state.value = _state.value.copy(
+                displayWidth = clampedW,
+                displayHeight = clampedH,
+                resolutionLabel = finalLabel,
+            )
+            inputDispatcher?.resize(clampedW, clampedH)
+            ensureInput().control("set_resolution", org.json.JSONObject().apply {
+                put("width", clampedW)
+                put("height", clampedH)
+                put("fps", fps)
+                displaySessionId?.let { put("session", it) }
+            })
+        }
+    }
+
+    fun onPause() {
+        playerHolder.onAppBackgrounded()
+    }
+
+    fun onResume() {
+        playerHolder.onAppForegrounded()
+    }
+
+    fun ctrlAltDel() {
+        ensureInput().control("ctrl_alt_del")
+    }
+
+    private suspend fun checkHostAlive(targetHost: String, targetPort: Int): Boolean =
+        withContext(Dispatchers.IO) {
+            try {
+                val req = okhttp3.Request.Builder()
+                    .url("http://$targetHost:$targetPort/health")
+                    .get()
+                    .build()
+                healthHttp.newCall(req).execute().use { it.isSuccessful }
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+    override fun onCleared() {
+        disconnect()
+        inputDispatcher?.release()
+        Thread({ runCatching { healthHttp.connectionPool.evictAll() } }, "OrbiHealthRelease")
+            .apply { isDaemon = true }.start()
+        super.onCleared()
+    }
+}

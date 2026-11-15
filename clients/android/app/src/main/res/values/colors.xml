@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ─────────────────────────────────────────────
+     Orbiscreen - Android Colors
+     https://github.com/shadow-x78/orbiscreen
+     ───────────────────────────────────────────── -->
+<resources>
+    <color name="orbi_background">#11111B</color>
+    <color name="orbi_splash_background">#11111B</color>
+</resources>

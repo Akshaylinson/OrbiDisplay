@@ -1,0 +1,70 @@
+# ─────────────────────────────────────────────
+# Orbiscreen - Git Ignore Rules
+# https://github.com/shadow-x78/orbiscreen
+# ─────────────────────────────────────────────
+
+# ── Rust / Cargo ──
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+.cargo/
+vendor/
+
+# ── Build artifacts ──
+/dist/
+/bin/
+/build-gui/
+crates/orbiscreen-gui/gen/
+debian/files
+*.deb
+*.rpm
+*.AppImage
+*.AppImage.zsync
+*.zsync
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# ── Gradle (Android) ──
+.gradle/
+**/build/
+captures/
+.cxx/
+.kotlin/
+local.properties
+**/local.properties
+
+# ── Android SDK scratch state ──
+/.android/
+/scratch/
+
+# ── AUR Local Test Artifacts ──
+/src/
+/pkg/
+*.pkg.tar.zst
+orbiscreen-*.tar.gz
+
+# ── Local secrets / keystores ──
+*.keystore
+*.jks
+local.properties
+google-services.json
+.env
+.env.local
+
+# ── Editor artifacts ──
+.vscode/
+.idea/
+*.swp
+*.sublime-*
+
+# ── OS files ──
+.DS_Store
+Thumbs.db
+
+# ── Logs / coverage ──
+*.log
+coverage/
+*.lcov

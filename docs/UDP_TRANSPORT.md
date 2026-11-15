@@ -1,0 +1,79 @@
+<div align="center">
+
+# UDP Annex-B Transport - Orbiscreen
+
+[![Version](https://img.shields.io/badge/version-0.41.0-2563eb?style=flat-square&logo=semver)](../CHANGELOG.md)
+[![License](https://img.shields.io/badge/license-GPL--3.0-dc2626?style=flat-square)](../LICENSE)
+![Rust](https://img.shields.io/badge/rust-1.92%2B-16a34a?style=flat-square&logo=rust)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Android-9333ea?style=flat-square&logo=linux)
+
+</div>
+
+<a href="UDP_TRANSPORT.md">🇬🇧 English</a> · <a href="UDP_TRANSPORT_AR.md">🇸🇦 العربية</a>
+
+---
+
+Android streams H.264 access units over UDP. The web client uses WebTransport Annex-B (`signaling_port + 2`, advertised as `wt_port`) and WebCodecs `VideoDecoder`. USB/AOA sends the same Annex-B access units on accessory bulk frames into MediaCodec; HTTP MPEG-TS on `/stream` is only the USB fallback. How I/P/IDR frames are split between datagrams, the reliable stream, and USB, and what happens on loss, is in [FRAME_TRANSPORT.md](FRAME_TRANSPORT.md).
+
+The daemon advertises `udp_port` on `GET /api/info` (`signaling_port + 1`, default **8789**) and `wt_port` (`signaling_port + 2`, default **8790**) plus `cert_sha256` for WebTransport `serverCertificateHashes`. Android uses UDP when that port is set and the host is not `127.0.0.1` / `localhost`. USB/AOA is not an IP path and does not use `adb reverse`; native video uses AOA `FLAG_VIDEO` frames (same `encode_video` AUs as `/au`) and keeps HTTP on the accessory TCP proxy for session, input, and IDR. The web client always uses WebTransport from the HTTPS UI on `wt_port`. The HTTPS listener serves the long-lived `https-cert.pem`; the QUIC endpoint keeps its own 14-day `wt-cert.pem`, whose hash is the `cert_sha256` above, so the certificate the Android client pins does not change when WebTransport renews. Video is sent as QUIC datagrams so a late frame can be dropped; a lost fragment waits for the next IDR. HTTP `/` and `/client/` redirect there. Android Wi-Fi keeps using HTTP on the signaling port.
+
+## Session
+
+On KDE the host does not create a virtual output at daemon start. The client calls `POST /api/session` with `{ name, key, width, height, bitrate_kbps, refresh_hz }` (native pixels). `key` is a stable per-device id (Android: last 8 hex of `ANDROID_ID`; web: 8 hex in `localStorage`). `bitrate_kbps` is clamped to 1_000-120_000 and `refresh_hz` to 30-240; the Android client sends its panel's real refresh rate, auto-detected from `Display.mode.refreshRate`, so the first session opens at the tablet's refresh instead of the host monitor's. That opens one output: the KScreen description is `name` (for example `Galaxy Tab S5e`) and the connector is `Virtual-Orbi-<key>` (for example `Virtual-Orbi-a1b2c3d4`). Two tablets with the same model name therefore get different connectors. KWin remembers position and scale by `connectorName` only, virtual outputs have no EDID, so the same device gets the same layout next time. If `key` is omitted, the host slugs `name` instead. If that connector is already enabled, the host tries `-2` then `-<pid>`. `DELETE /api/session?id=` or UDP **Bye** (type 10) closes that output; when the host closes the session itself (a resolution change recreates it), the Android client checks the daemon is alive, re-opens the display session, re-issues the UDP key for the new session id, and rebuilds the UDP player, so a resolution change over Wi-Fi no longer cuts the stream.
+
+1. Client sends **Hello** with the session token (same constant-time compare as HTTP Bearer). An optional `\0` + session id attaches this UDP socket to that display.
+2. Host replies **Hello-Ack** and starts DPLPMTUD. The client waits 1.5 s and treats probes that arrive before the ack as control, not failure.
+3. Video is withheld until a datagram size is confirmed. Fragments then use that size.
+4. Client pings every 500 ms. Missing all packets for 4 s ends the UDP session.
+5. A gap or a lost fragment holds P-frames until the next IDR. The client sends **IDR**; the host reuses `POST /api/control` `action: idr`.
+6. Idle UDP clients expire after 5 s without a packet. The last viewer of a session closes that client's virtual output.
+
+## Packet format
+
+Every datagram starts with magic `ORB1` and a type byte. Multi-byte fields are little-endian.
+
+| Type | Name | Layout after magic+type |
+|------|------|-------------------------|
+| 1 | Video | `key u8`, `seq u16`, `frag u16`, `frags u16`, `pts_ns u64`, `sent_ns u64`, payload (28-byte header) |
+| 2 | Hello | UTF-8 token, optional `\0` + session id |
+| 3 | Hello-Ack | empty |
+| 4 | Ping | `t0_ns u64` |
+| 5 | Pong | `t0_ns u64`, `host_ns u64` |
+| 6 | IDR | empty |
+| 7 | Probe | `id u16`, zero pad to the probe size |
+| 8 | Probe-Ack | `id u16`, `recv u16` (bytes received) |
+| 9 | PMTU | `datagram u16` (confirmed size) |
+| 10 | Bye | optional UTF-8 session id |
+
+## DPLPMTUD
+
+Search starts at 1200 bytes (576 when `ORBISCREEN_UDP_DROP_ABOVE` is set) and walks up to 1472, or `ORBISCREEN_UDP_MAX_DATAGRAM`. Each probe is padded to the candidate size. Three 250 ms timeouts fail a candidate. Late acks whose id is not the in-flight probe are ignored after the search completes.
+
+The host socket sets `IP_PMTUDISC_PROBE` so a too-large datagram is dropped instead of IP-fragmented.
+
+A 2560×1600 IDR is many fragments. A few percent datagram loss often means no complete keyframe arrives, so the surface stays on the last good frame (or black) while the session stays up. That is the hold-until-IDR rule, not a disconnect.
+
+## Android client
+
+`UdpPlayer` decodes with MediaCodec onto a `SurfaceView` letterboxed to the same content rect as touch mapping (`scaleMode` FIT by default). The stream menu shows send-to-assemble delay as `delay Nms`.
+
+## Latency
+
+`delay` is host-send to client-assemble for one access unit (clock-adjusted `sent_ns`). It does not include capture, encode, or MediaCodec/display after assemble.
+
+On a Samsung Galaxy Tab S5e (SM-T725) over 5 GHz Wi-Fi, 2560×1600@60, VA-API `vah264enc`:
+
+| Path | What is measured | Typical |
+|------|------------------|---------|
+| Previous (HTTP MPEG-TS + ExoPlayer) | ExoPlayer live offset target (min 8, max 48) | **24 ms** |
+| This transport (UDP Annex-B + MediaCodec) | send-to-assemble `delay` | **2-4 ms** (usually 2-3 ms) |
+
+That is about **10×** less player/transport delay than the HTTP live-offset target (~20 ms saved). Encode and display are the same on both paths. HTTP `/stream` still uses the 24 ms ExoPlayer offset.
+
+## Environment
+
+| Variable | Role |
+|----------|------|
+| `ORBISCREEN_UDP_MAX_DATAGRAM` | Upper bound of the PMTU search (clamped 576-65507, default 1472) |
+| `ORBISCREEN_UDP_DROP_ABOVE` | Pretend larger datagrams were lost (PMTU test hook) |
+| `ORBISCREEN_UDP_LOSS_PCT` | Randomly drop outgoing datagrams, 0-90 (loss test hook) |

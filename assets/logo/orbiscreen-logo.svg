@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- ─────────────────────────────────────────────
+       Orbiscreen - Project Logo
+       ─────────────────────────────────────────────
+       The O of Orbiscreen drawn as a display ring,
+       with the device screen - a solid dot - riding
+       its own path at the ring's edge, filling it:
+       the extension entering the host display, one
+       unbroken form. Flat, one accent color
+       (Catppuccin Blue #89b4fa, the brand accent),
+       two role classes (.orbi-s stroke, .orbi-f
+       fill). Square content box, dead-centered on
+       the 512 canvas by construction.
+       ───────────────────────────────────────────── -->
+  <defs>
+    <style>.orbi-f{fill:#89b4fa;}.orbi-s{fill:none;stroke:#89b4fa;}</style>
+  </defs>
+  <circle class="orbi-s" cx="256" cy="256" r="170" stroke-width="54"/>
+  <circle class="orbi-f" cx="376" cy="376" r="62"/>
+</svg>

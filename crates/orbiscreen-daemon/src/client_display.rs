@@ -1,0 +1,1276 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use orbiscreen_capture::kwin_virtual::{KwinVirtualCapture, KwinVirtualSpec};
+use orbiscreen_core::output::{client_protocol_names, device_label_for, sanitize_client_name};
+use orbiscreen_encode::{EncodeParams, Encoder, EncoderKind};
+use orbiscreen_input::{InputInjector, VirtualTouchscreenSpec};
+use orbiscreen_transport::{DisplayCommand, DisplayCtl, DisplayInfo, H264Packet, IncomingInput};
+use tokio::sync::{broadcast, mpsc, watch};
+use tracing::{info, warn};
+
+const IDLE_AFTER_LAST_VIEWER: Duration = Duration::from_secs(120);
+const WAITING_FOR_FIRST_VIEWER: Duration = Duration::from_secs(30);
+const OPEN_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
+
+const MAX_LIVE_SESSIONS: usize = 8;
+
+pub(crate) fn is_session_unclaimed(
+    viewers: usize,
+    video_receivers: usize,
+    ever_attached: bool,
+) -> bool {
+    viewers == 0 && video_receivers == 0 && !ever_attached
+}
+
+pub(crate) fn should_reap_idle_session(
+    viewers: usize,
+    video_receivers: usize,
+    ever_attached: bool,
+    idle_for: Duration,
+) -> bool {
+    if viewers > 0 || video_receivers > 0 {
+        return false;
+    }
+    let limit = if ever_attached {
+        IDLE_AFTER_LAST_VIEWER
+    } else {
+        WAITING_FOR_FIRST_VIEWER
+    };
+    idle_for >= limit
+}
+
+#[derive(Clone, Debug)]
+pub struct HubConfig {
+    pub encode_kind: EncoderKind,
+    pub bitrate_kbps: u32,
+    pub refresh_hz: u32,
+    pub default_width: u32,
+    pub default_height: u32,
+    pub stats: std::sync::Arc<orbiscreen_transport::Stats>,
+    pub encoder_in_use: Arc<std::sync::RwLock<Option<&'static str>>>,
+}
+
+struct Session {
+    info: DisplayInfo,
+    client_name: String,
+    client_key: Option<String>,
+
+    bitrate_kbps: Option<u32>,
+    refresh_hz: u32,
+    video_tx: broadcast::Sender<H264Packet>,
+    idr_tx: mpsc::Sender<()>,
+    input_tx: mpsc::Sender<IncomingInput>,
+    viewers: usize,
+    ever_attached: bool,
+    shutdown: watch::Sender<bool>,
+    capture: Option<Arc<KwinVirtualCapture>>,
+    encoder: Option<Arc<Encoder>>,
+    video_pump_handle: Option<tokio::task::JoinHandle<()>>,
+    input_pump_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+pub fn spawn_hub(cfg: HubConfig) -> DisplayCtl {
+    let (tx, rx) = mpsc::channel(64);
+    tokio::spawn(run_hub(cfg, rx));
+    DisplayCtl::new(tx)
+}
+
+async fn run_hub(mut cfg: HubConfig, mut rx: mpsc::Receiver<DisplayCommand>) {
+    let mut sessions: HashMap<String, Session> = HashMap::new();
+    let mut idle_at: HashMap<String, tokio::time::Instant> = HashMap::new();
+    let mut aliases: HashMap<String, String> = HashMap::new();
+    let mut idle_tick = tokio::time::interval(Duration::from_millis(250));
+    idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            cmd = rx.recv() => {
+                let Some(cmd) = cmd else { break };
+                if let DisplayCommand::Shutdown { reply } = cmd {
+                    let ids: Vec<String> = sessions.keys().cloned().collect();
+                    for id in ids {
+                        close_session(&mut sessions, &mut aliases, &id).await;
+                    }
+                    let _ = reply.send(());
+                    break;
+                }
+                handle_cmd(&mut cfg, &mut sessions, &mut idle_at, &mut aliases, cmd).await;
+            }
+            _ = idle_tick.tick() => {
+                let now = tokio::time::Instant::now();
+                let due: Vec<String> = idle_at
+                    .iter()
+                    .filter_map(|(id, at)| {
+                        let Some(session) = sessions.get(id) else {
+                            return Some(id.clone());
+                        };
+                        let idle_for = now.saturating_duration_since(*at);
+                        let limit = if session.ever_attached {
+                            IDLE_AFTER_LAST_VIEWER
+                        } else {
+                            WAITING_FOR_FIRST_VIEWER
+                        };
+                        if idle_for >= limit {
+                            Some(id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for id in due {
+                    let reap = sessions.get(&id).is_none_or(|session| {
+                        should_reap_idle_session(
+                            session.viewers,
+                            session.video_tx.receiver_count(),
+                            session.ever_attached,
+                            IDLE_AFTER_LAST_VIEWER,
+                        )
+                    });
+                    if reap {
+                        if let Some(session) = sessions.get(&id) {
+                            info!(
+                                viewers = session.viewers,
+                                receivers = session.video_tx.receiver_count(),
+                                ever_attached = session.ever_attached,
+                                "reaping idle client display"
+                            );
+                        }
+                        idle_at.remove(&id);
+                        if sessions.contains_key(&id) {
+                            close_session(&mut sessions, &mut aliases, &id).await;
+                        }
+                    } else {
+                        idle_at.insert(id.clone(), tokio::time::Instant::now());
+                    }
+                }
+            }
+        }
+    }
+    let ids: Vec<String> = sessions.keys().cloned().collect();
+    for id in ids {
+        close_session(&mut sessions, &mut aliases, &id).await;
+    }
+}
+
+pub(crate) fn target_resolution(
+    cfg: &HubConfig,
+    client_width: u32,
+    client_height: u32,
+) -> (u32, u32) {
+    if client_width > 0 && client_height > 0 {
+        return (client_width, client_height);
+    }
+    if cfg.default_width > 0 && cfg.default_height > 0 {
+        return (cfg.default_width, cfg.default_height);
+    }
+    (1920, 1080)
+}
+
+async fn handle_cmd(
+    cfg: &mut HubConfig,
+    sessions: &mut HashMap<String, Session>,
+    idle_at: &mut HashMap<String, tokio::time::Instant>,
+    aliases: &mut HashMap<String, String>,
+    cmd: DisplayCommand,
+) {
+    match cmd {
+        DisplayCommand::SetDefaults {
+            width,
+            height,
+            refresh_hz,
+        } => {
+            cfg.default_width = width;
+            cfg.default_height = height;
+            cfg.refresh_hz = refresh_hz;
+        }
+        DisplayCommand::Acquire {
+            name,
+            key,
+            width,
+            height,
+            bitrate_kbps,
+            refresh_hz,
+            reply,
+        } => {
+            let (target_w, target_h) = target_resolution(cfg, width, height);
+            let target_refresh = refresh_hz.unwrap_or(cfg.refresh_hz).clamp(30, 240);
+            if let Some(ref k) = key {
+                if let Some((existing_id, existing_session)) = sessions
+                    .iter_mut()
+                    .find(|(_, s)| s.client_key.as_ref() == Some(k))
+                {
+                    if existing_session.info.width == target_w
+                        && existing_session.info.height == target_h
+                        && existing_session.refresh_hz == target_refresh
+                    {
+                        if existing_session.viewers == 0 {
+                            idle_at.insert(existing_id.clone(), tokio::time::Instant::now());
+                        } else {
+                            idle_at.remove(existing_id);
+                        }
+                        let info = existing_session.info.clone();
+                        let _ = reply.send(Ok(info));
+                        return;
+                    }
+                    let id_to_remove = existing_id.clone();
+                    if let Some(old) = sessions.remove(&id_to_remove) {
+                        close_session_inner(old).await;
+                    }
+                }
+            }
+            if sessions.len() >= MAX_LIVE_SESSIONS {
+                let evictable: Vec<String> = sessions
+                    .iter()
+                    .filter(|(_, s)| {
+                        is_session_unclaimed(
+                            s.viewers,
+                            s.video_tx.receiver_count(),
+                            s.ever_attached,
+                        )
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                if evictable.is_empty() {
+                    warn!(
+                        sessions = sessions.len(),
+                        "refusing a new display session: live session limit reached"
+                    );
+                    let _ = reply.send(Err(format!(
+                        "too many active display sessions (limit {MAX_LIVE_SESSIONS})"
+                    )));
+                    return;
+                }
+                for id in evictable {
+                    close_session(sessions, aliases, &id).await;
+                }
+            }
+            let result = open_session(
+                cfg,
+                name,
+                key,
+                target_w,
+                target_h,
+                bitrate_kbps,
+                target_refresh,
+            )
+            .await;
+            if let Ok(session) = result {
+                let info = session.info.clone();
+                idle_at.insert(info.id.clone(), tokio::time::Instant::now());
+                sessions.insert(info.id.clone(), session);
+                let _ = reply.send(Ok(info));
+            } else if let Err(e) = result {
+                let _ = reply.send(Err(e));
+            }
+        }
+        DisplayCommand::Release { id } => {
+            idle_at.remove(&id);
+            close_session(sessions, aliases, &id).await;
+        }
+        DisplayCommand::Attach { id, key, reply } => {
+            let chosen =
+                resolve_attach_session_id(sessions, aliases, id.as_deref(), key.as_deref());
+            let sid = match chosen {
+                Some(sid) => sid,
+                None if (id.is_none() || id.as_deref() == Some("")) && sessions.is_empty() => {
+                    let w = if cfg.default_width > 0 {
+                        cfg.default_width
+                    } else {
+                        1920
+                    };
+                    let h = if cfg.default_height > 0 {
+                        cfg.default_height
+                    } else {
+                        1080
+                    };
+                    match open_session(cfg, "default".to_string(), None, w, h, None, cfg.refresh_hz)
+                        .await
+                    {
+                        Ok(session) => {
+                            let sid = session.info.id.clone();
+                            idle_at.insert(sid.clone(), tokio::time::Instant::now());
+                            sessions.insert(sid.clone(), session);
+                            sid
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(format!("no display session: {e}")));
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    let _ = reply.send(Err("no display session".into()));
+                    return;
+                }
+            };
+            if let Some(session) = sessions.get_mut(&sid) {
+                session.viewers = session.viewers.saturating_add(1);
+                session.ever_attached = true;
+                idle_at.remove(&sid);
+                let attached = orbiscreen_transport::AttachedDisplay {
+                    info: session.info.clone(),
+                    video: session.video_tx.subscribe(),
+                };
+                let _ = reply.send(Ok(attached));
+            }
+        }
+        DisplayCommand::Detach { id } => {
+            if let Some(session) = sessions.get_mut(&id) {
+                session.viewers = session.viewers.saturating_sub(1);
+                if session.viewers == 0 {
+                    idle_at.insert(id, tokio::time::Instant::now());
+                }
+            }
+        }
+        DisplayCommand::Idr { id } => {
+            let chosen = resolve_id(
+                sessions,
+                aliases,
+                if id.is_empty() {
+                    None
+                } else {
+                    Some(id.as_str())
+                },
+            );
+            if let Some(sid) = chosen {
+                if let Some(session) = sessions.get(&sid) {
+                    let _ = session.idr_tx.try_send(());
+                }
+            } else if id.is_empty() {
+                for session in sessions.values() {
+                    let _ = session.idr_tx.try_send(());
+                }
+            } else if let Some(session) = sessions
+                .values()
+                .find(|s| s.client_key.as_deref() == Some(&id))
+            {
+                let _ = session.idr_tx.try_send(());
+            }
+        }
+        DisplayCommand::Resize {
+            id,
+            width,
+            height,
+            refresh_hz,
+            reply,
+        } => {
+            let Some(resolved) = resolve_id(sessions, aliases, Some(id.as_str())) else {
+                let _ = reply.send(Err("unknown session".into()));
+                return;
+            };
+            let Some(old) = sessions.get(&resolved) else {
+                let _ = reply.send(Err("unknown session".into()));
+                return;
+            };
+            let new_refresh = refresh_hz.unwrap_or(cfg.refresh_hz).clamp(30, 240);
+            if old.info.width == width && old.info.height == height && old.refresh_hz == new_refresh
+            {
+                let _ = reply.send(Ok(old.info.clone()));
+                return;
+            }
+            let request = ResizeCarry {
+                name: old.client_name.clone(),
+                key: old.client_key.clone(),
+                bitrate_kbps: old.bitrate_kbps,
+                viewers: old.viewers,
+                ever_attached: old.ever_attached,
+            };
+            match open_session(
+                cfg,
+                request.name.clone(),
+                request.key.clone(),
+                width,
+                height,
+                request.bitrate_kbps,
+                new_refresh,
+            )
+            .await
+            {
+                Ok(new_session) => {
+                    let info = new_session.info.clone();
+                    let sid = info.id.clone();
+                    let carry = adopt_resize_state(new_session, request, idle_at);
+                    sessions.insert(sid.clone(), carry);
+
+                    for target in aliases.values_mut() {
+                        if *target == resolved {
+                            *target = sid.clone();
+                        }
+                    }
+                    aliases.insert(resolved.clone(), sid.clone());
+                    if id != resolved {
+                        aliases.insert(id.clone(), sid.clone());
+                    }
+
+                    if let Some(old) = sessions.remove(&resolved) {
+                        close_session_inner(old).await;
+                    }
+                    let _ = reply.send(Ok(info));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            }
+        }
+        DisplayCommand::Lookup { id, reply } => {
+            let chosen = resolve_id(sessions, aliases, id.as_deref());
+            let info = chosen.and_then(|sid| sessions.get(&sid).map(|s| s.info.clone()));
+            let _ = reply.send(info);
+        }
+        DisplayCommand::Input { id, event } => {
+            let chosen = resolve_id(sessions, aliases, id.as_deref());
+            if let Some(sid) = chosen {
+                if let Some(session) = sessions.get(&sid) {
+                    let _ = session.input_tx.try_send(event);
+                }
+            } else {
+                warn!(
+                    session = ?id,
+                    open = sessions.len(),
+                    "dropping input; no unambiguous display session"
+                );
+            }
+        }
+        DisplayCommand::Shutdown { reply } => {
+            let _ = reply.send(());
+        }
+    }
+}
+
+fn resolve_attach_session_id(
+    sessions: &HashMap<String, Session>,
+    aliases: &HashMap<String, String>,
+    id: Option<&str>,
+    key: Option<&str>,
+) -> Option<String> {
+    if let Some(req_id) = id.filter(|s| !s.is_empty()) {
+        if sessions.contains_key(req_id) {
+            return Some(req_id.to_string());
+        }
+        let mut hop = req_id;
+        for _ in 0..8 {
+            match aliases.get(hop) {
+                Some(next) if sessions.contains_key(next) => return Some(next.clone()),
+                Some(next) => hop = next.as_str(),
+                None => break,
+            }
+        }
+        if let Some(s) = sessions
+            .values()
+            .find(|s| s.client_key.as_deref() == Some(req_id))
+        {
+            return Some(s.info.id.clone());
+        }
+        return None;
+    }
+    if let Some(req_key) = key.filter(|s| !s.is_empty()) {
+        if let Some(s) = sessions
+            .values()
+            .find(|s| s.client_key.as_deref() == Some(req_key))
+        {
+            return Some(s.info.id.clone());
+        }
+    }
+    if sessions.len() == 1 {
+        return sessions.keys().next().cloned();
+    }
+    if sessions.is_empty() {
+        return None;
+    }
+    let unattached: Vec<&Session> = sessions.values().filter(|s| s.viewers == 0).collect();
+    if !unattached.is_empty() {
+        return unattached
+            .into_iter()
+            .max_by_key(|s| u64::from_str_radix(&s.info.id, 16).unwrap_or(0))
+            .map(|s| s.info.id.clone());
+    }
+    sessions
+        .values()
+        .max_by_key(|s| u64::from_str_radix(&s.info.id, 16).unwrap_or(0))
+        .map(|s| s.info.id.clone())
+}
+
+fn resolve_id(
+    sessions: &HashMap<String, Session>,
+    aliases: &HashMap<String, String>,
+    id: Option<&str>,
+) -> Option<String> {
+    if let Some(req) = id.filter(|s| !s.is_empty()) {
+        if sessions.contains_key(req) {
+            return Some(req.to_string());
+        }
+        let mut hop = req;
+        for _ in 0..8 {
+            match aliases.get(hop) {
+                Some(next) if sessions.contains_key(next) => return Some(next.clone()),
+                Some(next) => hop = next.as_str(),
+                None => break,
+            }
+        }
+        if let Some(s) = sessions
+            .values()
+            .find(|s| s.client_key.as_deref() == Some(req))
+        {
+            return Some(s.info.id.clone());
+        }
+        return None;
+    }
+    resolve_session_id(sessions.keys().map(String::as_str), id)
+}
+
+struct ResizeCarry {
+    name: String,
+    key: Option<String>,
+    bitrate_kbps: Option<u32>,
+    viewers: usize,
+    ever_attached: bool,
+}
+
+fn adopt_resize_state(
+    mut session: Session,
+    carry: ResizeCarry,
+    idle_at: &mut HashMap<String, tokio::time::Instant>,
+) -> Session {
+    session.viewers = carry.viewers;
+    session.ever_attached = carry.ever_attached;
+    let deadline = if session.ever_attached {
+        tokio::time::Instant::now() + IDLE_AFTER_LAST_VIEWER
+    } else {
+        tokio::time::Instant::now() + WAITING_FOR_FIRST_VIEWER
+    };
+    idle_at.insert(session.info.id.clone(), deadline);
+    session
+}
+
+fn resolve_session_id<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    id: Option<&str>,
+) -> Option<String> {
+    let keys: Vec<&str> = keys.into_iter().collect();
+    if let Some(id) = id.filter(|s| !s.is_empty()) {
+        return keys.contains(&id).then(|| id.to_string());
+    }
+    if keys.len() == 1 {
+        return Some(keys[0].to_string());
+    }
+    None
+}
+
+fn next_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{n:x}")
+}
+
+async fn open_session(
+    cfg: &HubConfig,
+    name: String,
+    key: Option<String>,
+    width: u32,
+    height: u32,
+    bitrate_kbps: Option<u32>,
+    refresh_hz: u32,
+) -> Result<Session, String> {
+    let width = width.clamp(320, 7680);
+    let height = height.clamp(240, 4320);
+    let (description, names) = client_protocol_names(&name, key.as_deref());
+    let spec = KwinVirtualSpec {
+        width,
+        height,
+        names,
+        description,
+        refresh_hz,
+    };
+    let mut open_task = tokio::task::spawn_blocking(move || KwinVirtualCapture::open(spec));
+    let capture = match tokio::time::timeout(OPEN_SESSION_TIMEOUT, &mut open_task).await {
+        Ok(Ok(Ok(capture))) => capture,
+        Ok(Ok(Err(e))) => return Err(e.to_string()),
+        Ok(Err(e)) => return Err(format!("kwin open task: {e}")),
+        Err(_) => {
+            tokio::spawn(async move {
+                if let Ok(Ok(capture)) = open_task.await {
+                    drop(capture);
+                }
+            });
+            return Err(format!(
+                "timed out after {}s waiting for KWin to create the virtual output",
+                OPEN_SESSION_TIMEOUT.as_secs()
+            ));
+        }
+    };
+    let capture = Arc::new(capture);
+    let connector = capture.connector_name().to_string();
+    let (actual_w, actual_h) = capture.dimensions();
+    info!(connector = %connector, width = actual_w, height = actual_h, "client virtual output created");
+
+    tokio::spawn({
+        let name = connector.clone();
+        async move {
+            orbiscreen_capture::kwin_virtual::ensure_output_enabled(&name).await;
+        }
+    });
+
+    let suggested_bitrate =
+        orbiscreen_encode::suggested_bitrate_kbps(actual_w, actual_h, refresh_hz);
+    let target_bitrate = match bitrate_kbps {
+        Some(client) => client.max(suggested_bitrate),
+        None => {
+            if cfg.bitrate_kbps > 0 && cfg.bitrate_kbps != 8000 {
+                cfg.bitrate_kbps
+            } else {
+                suggested_bitrate
+            }
+        }
+    };
+
+    let mut encoder = Encoder::new(EncodeParams {
+        kind: cfg.encode_kind,
+        bitrate_kbps: target_bitrate,
+        width: actual_w,
+        height: actual_h,
+        framerate: refresh_hz,
+        gop_on_demand: orbiscreen_encode::gop_on_demand_from_env(),
+    })
+    .map_err(|e| e.to_string())?;
+    let encoder_name = encoder.kind().as_str();
+    if let Ok(mut slot) = cfg.encoder_in_use.write() {
+        *slot = Some(encoder_name);
+    }
+    let mut encoded_rx = encoder
+        .subscribe()
+        .ok_or_else(|| "encoder returned no rx".to_string())?;
+    let encoder = Arc::new(encoder);
+    let (idr_tx, idr_rx) = mpsc::channel::<()>(8);
+    let _idr_pump = crate::pipeline::spawn_idr_pump(idr_rx, Arc::clone(&encoder));
+
+    let (video_tx, _) = broadcast::channel::<H264Packet>(64);
+    let video_out = video_tx.clone();
+    let stats_for_frames = std::sync::Arc::clone(&cfg.stats);
+    let video_pump_handle = tokio::spawn(async move {
+        let mut timestamps = crate::pipeline::TimestampBase::default();
+        while let Some(chunk) = encoded_rx.recv().await {
+            let packet = timestamps.normalize(chunk);
+            if video_out.receiver_count() > 0 {
+                stats_for_frames.note_frame();
+            }
+            let _ = video_out.send(packet);
+        }
+    });
+
+    let (input_tx, input_rx) = mpsc::channel::<IncomingInput>(1024);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    spawn_capture_pump(
+        Arc::clone(&capture),
+        Arc::clone(&encoder),
+        refresh_hz,
+        shutdown_rx,
+    );
+    let input_pump_handle = spawn_input_pump(
+        input_rx,
+        actual_w,
+        actual_h,
+        connector.clone(),
+        name.clone(),
+        key.clone(),
+    );
+
+    let id = next_id();
+    Ok(Session {
+        info: DisplayInfo {
+            id,
+            name: name.clone(),
+            connector,
+            width: actual_w,
+            height: actual_h,
+            encoder: encoder_name.to_string(),
+        },
+        client_name: name,
+        client_key: key,
+        bitrate_kbps,
+        refresh_hz,
+        video_tx,
+        idr_tx,
+        input_tx,
+        viewers: 0,
+        ever_attached: false,
+        shutdown: shutdown_tx,
+        capture: Some(capture),
+        encoder: Some(encoder),
+        video_pump_handle: Some(video_pump_handle),
+        input_pump_handle: Some(input_pump_handle),
+    })
+}
+
+fn spawn_capture_pump(
+    capture: Arc<KwinVirtualCapture>,
+    encoder: Arc<Encoder>,
+    refresh_hz: u32,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        const KEEPALIVE: Duration = Duration::from_millis(100);
+        let frame_interval_ns = 1_000_000_000u64 / refresh_hz.max(1) as u64;
+        let started = std::time::Instant::now();
+        let mut last_pts_ns: u64 = 0;
+        let mut keepalive_frame: Option<(u32, u32, Vec<u8>)> = None;
+        let mut next_frame_target_ns = started.elapsed().as_nanos() as u64;
+        loop {
+            if *shutdown.borrow() {
+                break;
+            }
+            let outcome = tokio::select! {
+                _ = shutdown.changed() => break,
+                result = tokio::time::timeout(KEEPALIVE, capture.next_frame()) => result,
+            };
+            match outcome {
+                Ok(Ok(frame)) => {
+                    keepalive_frame = Some((frame.width, frame.height, frame.data.to_vec()));
+                    let now_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    let pts_ns = now_ns.max(last_pts_ns.saturating_add(1_000));
+                    last_pts_ns = pts_ns;
+                    if let Err(e) =
+                        encoder.push_frame_owned(frame.data, frame.width, frame.height, pts_ns)
+                    {
+                        match e {
+                            orbiscreen_encode::EncodeError::Flushing
+                            | orbiscreen_encode::EncodeError::Eos => break,
+                            _ => warn!("frame push rejected: {e}"),
+                        }
+                    }
+                    next_frame_target_ns += frame_interval_ns;
+                    if next_frame_target_ns > now_ns {
+                        let sleep_ns = next_frame_target_ns - now_ns;
+                        if sleep_ns > 1_000_000 {
+                            tokio::time::sleep(std::time::Duration::from_nanos(sleep_ns)).await;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!("client display capture ended: {e}");
+                    break;
+                }
+                Err(_elapsed) => {
+                    let Some((width, height, data)) = &keepalive_frame else {
+                        continue;
+                    };
+                    let now_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    let pts_ns = now_ns.max(last_pts_ns.saturating_add(1_000));
+                    last_pts_ns = pts_ns;
+                    if let Err(
+                        orbiscreen_encode::EncodeError::Flushing
+                        | orbiscreen_encode::EncodeError::Eos,
+                    ) = encoder.push_frame(data, *width, *height, pts_ns)
+                    {
+                        break;
+                    }
+                    next_frame_target_ns += frame_interval_ns;
+                    if next_frame_target_ns > now_ns {
+                        let sleep_ns = next_frame_target_ns - now_ns;
+                        if sleep_ns > 1_000_000 {
+                            tokio::time::sleep(std::time::Duration::from_nanos(sleep_ns)).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn spawn_input_pump(
+    mut input_rx: mpsc::Receiver<IncomingInput>,
+    width: u32,
+    height: u32,
+    connector: String,
+    client_name: String,
+    client_key: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let label = client_key
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(client_name.as_str());
+        let prefix = if connector.starts_with(orbiscreen_core::output::CLIENT_CONNECTOR_PREFIX) {
+            device_label_for(&connector)
+        } else {
+            format!("OrbiScreen-{}", sanitize_client_name(label))
+        };
+        let spec = VirtualTouchscreenSpec {
+            width,
+            height,
+            output_name: Some(connector.clone()),
+            device_label: Some(prefix.clone()),
+            pointer_frame: crate::pointer_frame_for(Some(&connector), width, height),
+        };
+        let mut injector = match InputInjector::open_async(spec).await {
+            Ok(inj) => {
+                info!(connector = %connector, "input injector open for client display");
+                bind_inputs(&connector, &prefix).await;
+                Some(inj)
+            }
+            Err(e) => {
+                warn!("input injector unavailable for {connector}: {e}");
+                None
+            }
+        };
+        let mut cur_w = width;
+        let mut cur_h = height;
+        let mut pointer_active = true;
+        let mut frame_check = tokio::time::interval(std::time::Duration::from_secs(2));
+        frame_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let event = tokio::select! {
+                maybe = input_rx.recv() => match maybe {
+                    Some(event) => event,
+                    None => break,
+                },
+                _ = frame_check.tick() => {
+                    if let Some(inj) = injector.as_mut() {
+                        inj.apply_pointer_frame(crate::pointer_frame_for(
+                            Some(&connector),
+                            cur_w,
+                            cur_h,
+                        ));
+                    }
+                    continue;
+                }
+            };
+            let Some(inj) = injector.as_mut() else {
+                continue;
+            };
+            if matches!(
+                &event,
+                IncomingInput::Pointer(_)
+                    | IncomingInput::Key(_)
+                    | IncomingInput::RawPointer { .. }
+            ) {
+                pointer_active = true;
+            } else if matches!(&event, IncomingInput::Stylus(_) | IncomingInput::Touch(_))
+                && pointer_active
+            {
+                inj.park_cursor();
+                pointer_active = false;
+            }
+            if let IncomingInput::Resize { width, height } = &event {
+                cur_w = *width;
+                cur_h = *height;
+            }
+            crate::pipeline::dispatch_input(inj, event, |x, y| (x, y)).await;
+        }
+    })
+}
+
+async fn close_session(
+    sessions: &mut HashMap<String, Session>,
+    aliases: &mut HashMap<String, String>,
+    id: &str,
+) {
+    if let Some(session) = sessions.remove(id) {
+        close_session_inner(session).await;
+    }
+    aliases.retain(|_, v| v != id);
+}
+
+async fn close_session_inner(session: Session) {
+    let Session {
+        mut video_pump_handle,
+        mut input_pump_handle,
+        shutdown,
+        encoder,
+        capture,
+        info,
+        ..
+    } = session;
+    if let Some(h) = input_pump_handle.take() {
+        h.abort();
+        let _ = h.await;
+    }
+    let _ = shutdown.send(true);
+    let encoder_stop = encoder;
+    let capture_drop = capture;
+    if encoder_stop.is_some() || capture_drop.is_some() {
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(encoder) = encoder_stop.as_ref() {
+                encoder.stop();
+            }
+            if let Some(capture) = capture_drop {
+                info!(
+                    connector = %info.connector,
+                    "closed client virtual output"
+                );
+                drop(capture);
+            }
+        })
+        .await;
+    }
+    if let Some(mut h) = video_pump_handle.take() {
+        if tokio::time::timeout(std::time::Duration::from_millis(500), &mut h)
+            .await
+            .is_err()
+        {
+            h.abort();
+        }
+    }
+}
+
+pub(crate) fn event_paths_from_introspect(xml: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut rest = xml;
+    while let Some(idx) = rest.find(r#"name="event"#) {
+        let start = idx + r#"name=""#.len();
+        let after = &rest[start..];
+        let Some(end) = after.find('"') else {
+            break;
+        };
+        let name = &after[..end];
+        if name.starts_with("event") && name[5..].bytes().all(|b| b.is_ascii_digit()) {
+            paths.push(format!("/org/kde/KWin/InputDevice/{name}"));
+        }
+        rest = &after[end..];
+    }
+    paths
+}
+
+pub(crate) async fn list_kwin_input_device_paths(conn: &zbus::Connection) -> Vec<String> {
+    if let Ok(proxy) = zbus::Proxy::new(
+        conn,
+        "org.kde.KWin",
+        "/org/kde/KWin/InputDevice",
+        "org.freedesktop.DBus.Introspectable",
+    )
+    .await
+    {
+        if let Ok(xml) = proxy.call::<_, _, String>("Introspect", &()).await {
+            let paths = event_paths_from_introspect(&xml);
+            if !paths.is_empty() {
+                return paths;
+            }
+        }
+    }
+    (0..=512)
+        .map(|idx| format!("/org/kde/KWin/InputDevice/event{idx}"))
+        .collect()
+}
+
+async fn bind_inputs(target_output: &str, device_prefix: &str) {
+    let mut last_bound = 0;
+    let mut last_resolved = target_output.to_string();
+    for _attempt in 0..6 {
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let Some(resolved) =
+            orbiscreen_capture::kwin_virtual::preferred_tablet_output(Some(target_output))
+        else {
+            continue;
+        };
+        last_resolved = resolved.clone();
+        if let Ok(conn) = zbus::Connection::session().await {
+            let exact = format!("{device_prefix} ");
+            last_bound =
+                bind_named_kwin_devices(&conn, &resolved, |name| name.starts_with(&exact)).await;
+            if last_bound >= 3 {
+                return;
+            }
+        }
+    }
+    if last_bound < 3 {
+        warn!(
+            bound = last_bound,
+            prefix = device_prefix,
+            output = %last_resolved,
+            "KWin input bind found fewer than 3 OrbiScreen devices after 6 attempts"
+        );
+    }
+}
+
+pub(crate) async fn bind_named_kwin_devices<F>(
+    conn: &zbus::Connection,
+    resolved: &str,
+    mut name_matches: F,
+) -> usize
+where
+    F: FnMut(&str) -> bool,
+{
+    let uuid = orbiscreen_capture::kwin_virtual::output_uuid(resolved);
+    let mut bound = 0;
+    for path in list_kwin_input_device_paths(conn).await {
+        let Ok(proxy) = zbus::Proxy::new(
+            conn,
+            "org.kde.KWin",
+            path.as_str(),
+            "org.kde.KWin.InputDevice",
+        )
+        .await
+        else {
+            continue;
+        };
+        let Ok(name) = proxy.get_property::<String>("name").await else {
+            continue;
+        };
+        if !name_matches(&name) {
+            continue;
+        }
+        if let Err(e) = proxy.set_property::<&str>("outputName", resolved).await {
+            warn!("could not set outputName={resolved} on {path} ({name}): {e}");
+            continue;
+        }
+        if let Some(uuid) = uuid.as_deref() {
+            let _ = proxy.set_property::<&str>("outputUuid", uuid).await;
+        }
+        let _ = proxy.set_property::<bool>("mapToWorkspace", false).await;
+        info!("bound KWin input device {path} ({name}) to output {resolved}");
+        bound += 1;
+    }
+    bound
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        adopt_resize_state, event_paths_from_introspect, is_session_unclaimed,
+        should_reap_idle_session, ResizeCarry, MAX_LIVE_SESSIONS,
+    };
+    use crate::client_display::Session;
+    use orbiscreen_transport::IncomingInput;
+    use std::collections::HashMap;
+
+    #[test]
+    fn only_unwatched_never_viewed_sessions_may_be_evicted_for_the_session_limit() {
+        assert!(is_session_unclaimed(0, 0, false));
+        assert!(!is_session_unclaimed(1, 0, false), "has a viewer");
+        assert!(!is_session_unclaimed(0, 1, false), "a stream is subscribed");
+        assert!(!is_session_unclaimed(0, 0, true), "previously attached");
+    }
+
+    #[test]
+    fn the_session_limit_is_usable_and_bounded() {
+        let budget = (0..MAX_LIVE_SESSIONS).count();
+        assert!(budget >= 4, "limit too low for normal use");
+        assert!(budget <= 32, "limit leaves the encoder pool unbounded");
+    }
+
+    fn carry(name: &str, viewers: usize, ever_attached: bool) -> ResizeCarry {
+        ResizeCarry {
+            name: name.to_string(),
+            key: None,
+            bitrate_kbps: None,
+            viewers,
+            ever_attached,
+        }
+    }
+
+    fn session_with(id: &str, ever_attached: bool) -> Session {
+        use tokio::sync::{broadcast, watch};
+        let (video_tx, _) = broadcast::channel(1);
+        let (input_tx, _) = tokio::sync::mpsc::channel::<IncomingInput>(1);
+        let (idr_tx, _) = tokio::sync::mpsc::channel::<()>(1);
+        let (shutdown, _) = watch::channel(false);
+        Session {
+            info: orbiscreen_transport::DisplayInfo {
+                id: id.to_string(),
+                name: "test".into(),
+                connector: "Virtual-TEST".into(),
+                width: 1280,
+                height: 720,
+                encoder: "auto".into(),
+            },
+            client_name: "test".into(),
+            client_key: None,
+            bitrate_kbps: None,
+            refresh_hz: 60,
+            video_tx,
+            idr_tx,
+            input_tx,
+            viewers: 0,
+            ever_attached,
+            shutdown,
+            capture: None,
+            encoder: None,
+            video_pump_handle: None,
+            input_pump_handle: None,
+        }
+    }
+
+    #[test]
+    fn resize_swap_preserves_viewers_and_deadline() {
+        let mut idle_at = HashMap::new();
+        let fresh = adopt_resize_state(
+            session_with("a", false),
+            carry("test", 0, false),
+            &mut idle_at,
+        );
+        assert_eq!(fresh.viewers, 0);
+        assert!(!fresh.ever_attached);
+        let waiting = idle_at.get("a").copied().unwrap();
+        let mut idle_at2 = HashMap::new();
+        let viewed = adopt_resize_state(
+            session_with("b", true),
+            carry("test", 2, true),
+            &mut idle_at2,
+        );
+        assert_eq!(viewed.viewers, 2);
+        assert!(viewed.ever_attached);
+        let after = idle_at2.get("b").copied().unwrap();
+        assert!(after > waiting);
+    }
+
+    #[test]
+    fn subscribed_video_is_not_reaped_at_the_idle_timeout() {
+        use std::time::Duration;
+        assert!(!should_reap_idle_session(
+            0,
+            1,
+            true,
+            Duration::from_secs(120),
+        ));
+        assert!(!should_reap_idle_session(
+            1,
+            0,
+            true,
+            Duration::from_secs(120),
+        ));
+        assert!(should_reap_idle_session(
+            0,
+            0,
+            true,
+            Duration::from_secs(120),
+        ));
+        assert!(!should_reap_idle_session(
+            0,
+            0,
+            true,
+            Duration::from_secs(119),
+        ));
+        assert!(should_reap_idle_session(
+            0,
+            0,
+            false,
+            Duration::from_secs(30),
+        ));
+        assert!(!should_reap_idle_session(
+            0,
+            0,
+            false,
+            Duration::from_secs(29),
+        ));
+    }
+
+    #[test]
+    fn resize_swap_initializes_idle_deadline_for_never_attached() {
+        let mut idle_at = HashMap::new();
+        adopt_resize_state(
+            session_with("c", false),
+            carry("test", 0, false),
+            &mut idle_at,
+        );
+        assert!(idle_at.contains_key("c"));
+    }
+
+    #[test]
+    fn resolve_id_does_not_steal_the_only_session_when_id_is_unknown() {
+        use super::resolve_session_id;
+        let one = ["web"];
+        assert_eq!(resolve_session_id(one, None).as_deref(), Some("web"));
+        assert_eq!(resolve_session_id(one, Some("")).as_deref(), Some("web"));
+        assert_eq!(resolve_session_id(one, Some("web")).as_deref(), Some("web"));
+        assert_eq!(resolve_session_id(one, Some("stale")), None);
+        let two = ["web", "android"];
+        assert_eq!(resolve_session_id(two, None), None);
+        assert_eq!(
+            resolve_session_id(two, Some("android")).as_deref(),
+            Some("android")
+        );
+    }
+
+    #[test]
+    fn resolve_attach_session_id_prefers_key_unattached_and_newest() {
+        use super::resolve_attach_session_id;
+        let aliases = HashMap::new();
+        let mut sessions = HashMap::new();
+        let mut s1 = session_with("1", true);
+        s1.client_key = Some("device-a".into());
+        s1.viewers = 1;
+        sessions.insert("1".into(), s1);
+
+        let mut s2 = session_with("2", false);
+        s2.client_key = Some("device-b".into());
+        s2.viewers = 0;
+        sessions.insert("2".into(), s2);
+
+        assert_eq!(
+            resolve_attach_session_id(&sessions, &aliases, Some("1"), None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            resolve_attach_session_id(&sessions, &aliases, None, Some("device-a")).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            resolve_attach_session_id(&sessions, &aliases, None, Some("device-b")).as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            resolve_attach_session_id(&sessions, &aliases, None, None).as_deref(),
+            Some("2")
+        );
+
+        if let Some(s) = sessions.get_mut("2") {
+            s.viewers = 1;
+        }
+        assert_eq!(
+            resolve_attach_session_id(&sessions, &aliases, None, None).as_deref(),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn introspect_xml_includes_high_event_nodes() {
+        let xml = r#"<!DOCTYPE node PUBLIC "-
+"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node>
+  <interface name="org.freedesktop.DBus.Introspectable"/>
+  <node name="event0"/>
+  <node name="event31"/>
+  <node name="event256"/>
+  <node name="event260"/>
+  <node name="not-an-event"/>
+</node>"#;
+        let paths = event_paths_from_introspect(xml);
+        assert_eq!(
+            paths,
+            vec![
+                "/org/kde/KWin/InputDevice/event0",
+                "/org/kde/KWin/InputDevice/event31",
+                "/org/kde/KWin/InputDevice/event256",
+                "/org/kde/KWin/InputDevice/event260",
+            ]
+        );
+    }
+
+    fn hub(w: u32, h: u32) -> super::HubConfig {
+        super::HubConfig {
+            encode_kind: orbiscreen_encode::EncoderKind::Auto,
+            bitrate_kbps: 8000,
+            refresh_hz: 60,
+            default_width: w,
+            default_height: h,
+            stats: std::sync::Arc::new(orbiscreen_transport::Stats::default()),
+            encoder_in_use: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    #[test]
+    fn the_client_request_beats_the_host_default() {
+        let cfg = hub(1920, 1152);
+        assert_eq!(super::target_resolution(&cfg, 1280, 800), (1280, 800));
+        assert_eq!(super::target_resolution(&cfg, 2560, 1536), (2560, 1536));
+    }
+
+    #[test]
+    fn the_host_default_is_used_when_the_client_asks_for_nothing() {
+        let cfg = hub(1920, 1152);
+        assert_eq!(super::target_resolution(&cfg, 0, 0), (1920, 1152));
+        let empty = hub(0, 0);
+        assert_eq!(super::target_resolution(&empty, 0, 0), (1920, 1080));
+    }
+}

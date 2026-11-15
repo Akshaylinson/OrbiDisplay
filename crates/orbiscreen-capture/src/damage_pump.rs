@@ -1,0 +1,431 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use std::os::fd::AsFd as _;
+use wayland_client::protocol::{
+    wl_buffer, wl_compositor, wl_output, wl_region, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+};
+use wayland_client::{Connection, Dispatch, QueueHandle};
+use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
+use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+
+const DEFAULT_OUTPUT_HINT: &str = "ORBISCREEN";
+
+pub(crate) struct DamagePumpHandle {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for DamagePumpHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub(crate) fn spawn(period: Duration, hint: &str) -> DamagePumpHandle {
+    let stop = Arc::new(AtomicBool::new(false));
+    let pump_stop = Arc::clone(&stop);
+    let hint = if hint.is_empty() {
+        DEFAULT_OUTPUT_HINT.to_string()
+    } else {
+        hint.to_string()
+    };
+    let thread = std::thread::Builder::new()
+        .name("orbiscreen-damage".into())
+        .spawn(move || {
+            let mut last = None;
+            for _ in 0..30 {
+                if pump_stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                match run(Some(hint.clone()), period, Arc::clone(&pump_stop)) {
+                    Ok(()) => return,
+                    Err(e) => {
+                        last = Some(e);
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+            if let Some(e) = last {
+                tracing::warn!("damage pump disabled: {e}");
+            }
+        })
+        .ok();
+    DamagePumpHandle { stop, thread }
+}
+
+fn run(
+    target_output: Option<String>,
+    period: Duration,
+    stop: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let conn = Connection::connect_to_env().map_err(|e| format!("wayland connect: {e}"))?;
+    let (globals, mut queue) = wayland_client::globals::registry_queue_init::<PumpState>(&conn)
+        .map_err(|e| format!("registry: {e}"))?;
+    let qh = queue.handle();
+    let mut state = PumpState::default();
+
+    let compositor: wl_compositor::WlCompositor = globals
+        .bind(&qh, 4..=5, ())
+        .map_err(|e| format!("compositor: {e}"))?;
+    let shm: wl_shm::WlShm = globals
+        .bind(&qh, 1..=1, ())
+        .map_err(|e| format!("shm: {e}"))?;
+    let layer_shell: zwlr_layer_shell_v1::ZwlrLayerShellV1 = globals
+        .bind(&qh, 1..=3, ())
+        .map_err(|e| format!("layer shell unsupported: {e}"))?;
+
+    let mut bound_outputs = std::collections::HashSet::new();
+    for output_global in globals
+        .contents()
+        .clone_list()
+        .into_iter()
+        .filter(|g| g.interface == "wl_output")
+    {
+        bound_outputs.insert(output_global.name);
+        let _: wl_output::WlOutput =
+            globals
+                .registry()
+                .bind(output_global.name, output_global.version.min(4), &qh, ());
+    }
+    queue
+        .roundtrip(&mut state)
+        .map_err(|e| format!("roundtrip: {e}"))?;
+
+    let find_target = |state: &PumpState| -> Option<wl_output::WlOutput> {
+        if let Some(ref name_target) = target_output {
+            let clean_target = name_target.trim().to_uppercase();
+            if !clean_target.is_empty() && clean_target != DEFAULT_OUTPUT_HINT {
+                let target_slug = clean_target
+                    .strip_prefix("VIRTUAL-")
+                    .unwrap_or(&clean_target);
+
+                if let Some((proxy, _)) = state
+                    .output_names
+                    .iter()
+                    .find(|(_, name)| name.to_uppercase() == clean_target)
+                {
+                    return Some(proxy.clone());
+                }
+
+                if let Some((proxy, _)) = state.output_names.iter().find(|(_, name)| {
+                    let upper = name.to_uppercase();
+                    let upper_slug = upper.strip_prefix("VIRTUAL-").unwrap_or(&upper);
+                    upper_slug == target_slug
+                }) {
+                    return Some(proxy.clone());
+                }
+
+                return None;
+            }
+        }
+
+        state
+            .output_names
+            .iter()
+            .find(|(_, name)| {
+                let upper = name.to_uppercase();
+                upper.contains(DEFAULT_OUTPUT_HINT) || upper.starts_with("VIRTUAL")
+            })
+            .map(|(proxy, _)| proxy.clone())
+            .or_else(|| {
+                state
+                    .output_names
+                    .iter()
+                    .find(|(_, name)| name.to_uppercase().contains("VIRTUAL"))
+                    .map(|(proxy, _)| proxy.clone())
+            })
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut target = find_target(&state);
+    while target.is_none() && std::time::Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let new_outputs: Vec<_> = globals
+            .contents()
+            .clone_list()
+            .into_iter()
+            .filter(|g| g.interface == "wl_output" && !bound_outputs.contains(&g.name))
+            .collect();
+        for output_global in new_outputs {
+            bound_outputs.insert(output_global.name);
+            let _: wl_output::WlOutput =
+                globals
+                    .registry()
+                    .bind(output_global.name, output_global.version.min(4), &qh, ());
+        }
+        let _ = queue.roundtrip(&mut state);
+        target = find_target(&state);
+        if target.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let Some(output) = target else {
+        let hint = target_output.as_deref().unwrap_or(DEFAULT_OUTPUT_HINT);
+        return Err(format!("no virtual output matching '{hint}' found"));
+    };
+    if let Some((_, name)) = state.output_names.iter().find(|(p, _)| p == &output) {
+        tracing::info!("damage pump attached to Wayland output: {name}");
+    }
+
+    let surface = compositor.create_surface(&qh, ());
+    let input_region: wl_region::WlRegion = compositor.create_region(&qh, ());
+    input_region.add(0, 0, 0, 0);
+    surface.set_input_region(Some(&input_region));
+
+    let layer_surface = layer_shell.get_layer_surface(
+        &surface,
+        Some(&output),
+        zwlr_layer_shell_v1::Layer::Overlay,
+        "orbiscreen-damage".to_owned(),
+        &qh,
+        (),
+    );
+    layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+    layer_surface.set_exclusive_zone(-1);
+    surface.commit();
+
+    queue
+        .roundtrip(&mut state)
+        .map_err(|e| format!("configure roundtrip: {e}"))?;
+    let cfg_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while state.configured.is_none() && std::time::Instant::now() < cfg_deadline {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let _ = queue.roundtrip(&mut state);
+        if state.configured.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let Some((serial, width, height)) = state.configured else {
+        return Err("layer surface never configured".into());
+    };
+    if width <= 0 || height <= 0 {
+        return Err("layer surface configured with empty size".into());
+    };
+    layer_surface.ack_configure(serial);
+
+    let stride = (width as i64)
+        .checked_mul(4)
+        .filter(|v| *v <= i32::MAX as i64)
+        .ok_or("configured width too large for the damage pump")? as i32;
+    let pool_size = (stride as i64)
+        .checked_mul(height as i64)
+        .and_then(|v| v.checked_mul(2))
+        .filter(|v| *v <= i32::MAX as i64)
+        .ok_or("configured surface too large for the damage pump")? as i32;
+    let mut file = orbiscreen_core::shm::anonymous_file(
+        "orbiscreen-damage-shm",
+        usize::try_from(pool_size).map_err(|e| format!("shm size: {e}"))?,
+    )
+    .map_err(|e| format!("shm memfd: {e}"))?;
+    let offset = (pool_size / 2) as u64;
+    if std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset)).is_ok() {
+        let _ = std::io::Write::write_all(&mut file, &[1, 0, 0, 1]);
+    }
+    let pool = shm.create_pool(file.as_fd(), pool_size, &qh, ());
+    let buffer_a = pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, &qh, ());
+    let buffer_b = pool.create_buffer(
+        pool_size / 2,
+        width,
+        height,
+        stride,
+        wl_shm::Format::Argb8888,
+        &qh,
+        (),
+    );
+
+    tracing::info!(
+        "damage pump active on virtual display ({width}x{height}, every {}ms)",
+        period.as_millis()
+    );
+
+    surface.attach(Some(&buffer_a), 0, 0);
+    surface.damage_buffer(0, 0, width, height);
+    surface.commit();
+
+    let mut flip = false;
+    let mut next_commit = std::time::Instant::now();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        next_commit += period;
+        let now = std::time::Instant::now();
+        if next_commit > now {
+            std::thread::sleep(next_commit - now);
+        } else {
+            next_commit = std::time::Instant::now();
+        }
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        queue
+            .dispatch_pending(&mut state)
+            .map_err(|e| format!("dispatch: {e}"))?;
+        let _ = conn.flush();
+        if state.closed {
+            return Err("layer surface closed by compositor".into());
+        }
+        let next = if flip { &buffer_a } else { &buffer_b };
+        surface.attach(Some(next), 0, 0);
+        surface.damage_buffer(0, 0, width, height);
+        surface.commit();
+        flip = !flip;
+    }
+}
+
+#[derive(Default)]
+struct PumpState {
+    configured: Option<(u32, i32, i32)>,
+    output_names: Vec<(wl_output::WlOutput, String)>,
+    closed: bool,
+}
+
+impl Dispatch<wl_registry::WlRegistry, wayland_client::globals::GlobalListContents> for PumpState {
+    fn event(
+        _: &mut Self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _: &wayland_client::globals::GlobalListContents,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            if interface == "wl_output" {
+                let _: wl_output::WlOutput = registry.bind(name, version.min(4), qh, ());
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_compositor::WlCompositor, ()> for PumpState {
+    fn event(
+        _: &mut Self,
+        _: &wl_compositor::WlCompositor,
+        _: wl_compositor::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+impl Dispatch<wl_shm::WlShm, ()> for PumpState {
+    fn event(
+        _: &mut Self,
+        _: &wl_shm::WlShm,
+        _: wl_shm::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+impl Dispatch<wl_shm_pool::WlShmPool, ()> for PumpState {
+    fn event(
+        _: &mut Self,
+        _: &wl_shm_pool::WlShmPool,
+        _: wl_shm_pool::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+impl Dispatch<wl_buffer::WlBuffer, ()> for PumpState {
+    fn event(
+        _: &mut Self,
+        _: &wl_buffer::WlBuffer,
+        _: wl_buffer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+impl Dispatch<wl_surface::WlSurface, ()> for PumpState {
+    fn event(
+        _: &mut Self,
+        _: &wl_surface::WlSurface,
+        _: wl_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+impl Dispatch<wl_region::WlRegion, ()> for PumpState {
+    fn event(
+        _: &mut Self,
+        _: &wl_region::WlRegion,
+        _: wl_region::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for PumpState {
+    fn event(
+        _: &mut Self,
+        _: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
+        _: zwlr_layer_shell_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for PumpState {
+    fn event(
+        state: &mut Self,
+        _layer: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                state.configured = Some((serial, width as i32, height as i32));
+            }
+            zwlr_layer_surface_v1::Event::Closed => {
+                tracing::warn!("damage pump surface closed by compositor");
+                state.closed = true;
+            }
+            _ => {}
+        }
+    }
+}
+impl Dispatch<wl_output::WlOutput, ()> for PumpState {
+    fn event(
+        state: &mut Self,
+        proxy: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Name { name } = event {
+            state.output_names.push((proxy.clone(), name));
+        }
+    }
+}

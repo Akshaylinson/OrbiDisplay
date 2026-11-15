@@ -1,0 +1,108 @@
+# ─────────────────────────────────────────────
+# Orbiscreen - Cargo Workspace
+# https://github.com/shadow-x78/orbiscreen
+# ─────────────────────────────────────────────
+
+# ── Workspace Members ──
+[workspace]
+resolver = "2"
+members = [
+    "crates/orbiscreen-core",
+    "crates/orbiscreen-display",
+    "crates/orbiscreen-capture",
+    "crates/orbiscreen-encode",
+    "crates/orbiscreen-input",
+    "crates/orbiscreen-transport",
+    "crates/orbiscreen-daemon",
+]
+default-members = [
+    "crates/orbiscreen-core",
+    "crates/orbiscreen-display",
+    "crates/orbiscreen-capture",
+    "crates/orbiscreen-encode",
+    "crates/orbiscreen-input",
+    "crates/orbiscreen-transport",
+    "crates/orbiscreen-daemon",
+]
+
+# ── Package Metadata ──
+[workspace.package]
+version = "0.41.0"
+edition = "2021"
+rust-version = "1.92"
+license = "GPL-3.0-or-later"
+authors = ["shadow-x78"]
+repository = "https://github.com/shadow-x78/orbiscreen"
+homepage = "https://github.com/shadow-x78/orbiscreen"
+description = "Turn any Android tablet or phone into a high-performance second monitor for Linux (Wayland & X11) with ultra-low latency, hardware encoding, and reverse touch control."
+readme = "README.md"
+keywords = ["second-monitor", "virtual-display", "wayland", "android", "extended-display"]
+categories = ["command-line-utilities", "multimedia::video", "hardware-support"]
+
+# ── Shared Dependencies ──
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+thiserror = "2"
+
+evdi = "0.8"
+drm-fourcc = "2.2"
+
+x11rb = { version = "0.14", features = ["allow-unsafe-code", "xtest", "shm", "randr"] }
+ashpd = { version = "0.13", features = ["backend", "tokio", "screencast", "remote_desktop"] }
+evdevil = "0.5"
+enumflags2 = "0.7"
+
+wayland-client = { version = "0.31", features = ["log"] }
+wayland-backend = { version = "0.3", features = ["log"] }
+wayland-protocols-plasma = { version = "0.3", default-features = false, features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", default-features = false, features = ["client"] }
+wayland-scanner = "0.31"
+xkbcommon = "0.9"
+libc = "0.2"
+
+gstreamer = "0.25"
+gstreamer-app = "0.25"
+
+mdns-sd = "0.20"
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+rand = "0.9"
+base64 = "0.22"
+
+clap = { version = "4", features = ["derive"] }
+hostname = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
+log = "0.4"
+zbus = { version = "5", features = ["tokio"] }
+
+# ── Rust Lints ──
+[workspace.lints.rust]
+unsafe_code = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+
+# ── Clippy Lints ──
+[workspace.lints.clippy]
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+significant_drop_tightening = "allow"
+
+# ── Release Profile ──
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# ── Dev Profile ──
+[profile.dev]
+opt-level = 1

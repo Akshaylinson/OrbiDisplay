@@ -1,0 +1,24 @@
+
+package com.orbiscreen.android.usb
+
+import java.net.Socket
+
+internal object AoaAcceptedSocket {
+    fun readLoop(socket: Socket, running: () -> Boolean = { true }, onChunk: (ByteArray, Int) -> Unit) {
+        val input = try {
+            if (socket.isClosed) return
+            socket.getInputStream()
+        } catch (_: Exception) {
+            return
+        }
+        val buf = ByteArray(16384)
+        try {
+            while (running() && !socket.isClosed) {
+                val n = input.read(buf)
+                if (n <= 0) break
+                onChunk(buf, n)
+            }
+        } catch (_: Exception) {
+        }
+    }
+}

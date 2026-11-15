@@ -1,0 +1,1629 @@
+use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
+
+use crate::aoa_video::{
+    self, encode_video_close, encode_video_open_ack, lane_for, pack_h264_packet, parse_aoa_frame,
+    Lane, FRAME_FLAG_CLOSE, FRAME_FLAG_DATA, FRAME_FLAG_OPEN, FRAME_FLAG_RESET, FRAME_FLAG_VIDEO,
+    FRAME_HEADER_LEN, MAX_PAYLOAD_LEN, VIDEO_QUEUE_CAP,
+};
+use crate::display::DisplayCtl;
+
+#[repr(C)]
+struct UsbDevFsCtrlTransfer {
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+    length: u16,
+    timeout: u32,
+    data: *mut u8,
+}
+
+#[repr(C)]
+struct UsbDevFsBulkTransfer {
+    ep: u32,
+    len: u32,
+    timeout: u32,
+    _pad: u32,
+    data: *mut u8,
+}
+
+#[repr(C)]
+struct UsbDevFsDisconnectClaim {
+    interface: u32,
+    flags: u32,
+    driver: [u8; 256],
+}
+
+extern "C" {
+    fn ioctl(fd: i32, request: u64, ...) -> i32;
+}
+
+const USBDEVFS_CONTROL: u64 = 0xc0185500;
+const USBDEVFS_BULK: u64 = 0xc0185502;
+const USBDEVFS_CLAIMINTERFACE: u64 = 0x8004550f;
+const USBDEVFS_RELEASEINTERFACE: u64 = 0x80045510;
+const USBDEVFS_DISCONNECT_CLAIM: u64 = 0x8108551b;
+
+const AOA_GET_PROTOCOL: u8 = 51;
+const AOA_SEND_STRING: u8 = 52;
+const AOA_START_ACCESSORY: u8 = 53;
+const PRIO_QUEUE_CAP: usize = 8;
+const USB_TRANSIENT_RETRIES: u32 = 12;
+
+const WRITE_FAILURE_LIMIT: u32 = 20;
+type StreamEntry = (
+    std::sync::mpsc::SyncSender<Vec<u8>>,
+    TcpStream,
+    Arc<AtomicBool>,
+    Arc<AtomicU64>,
+);
+type StreamMap = Arc<Mutex<HashMap<u16, StreamEntry>>>;
+
+const MAX_AOA_STREAMS: usize = 48;
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const EVICTION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+static EVICTION_REPORTS: AtomicUsize = AtomicUsize::new(0);
+static LAST_EVICTION_REPORT_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn touch(activity: &AtomicU64) {
+    activity.store(now_ms(), Ordering::Relaxed);
+}
+
+fn reap_idle_streams(
+    map: &mut HashMap<u16, StreamEntry>,
+    prio_tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+) {
+    let cutoff = now_ms().saturating_sub(STREAM_IDLE_TIMEOUT.as_millis() as u64);
+    let stale: Vec<u16> = map
+        .iter()
+        .filter(|(_, (_, _, _, activity))| activity.load(Ordering::Relaxed) < cutoff)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in stale {
+        if let Some((_, stream, _, _)) = map.remove(&id) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            send_proxy_close(id, prio_tx);
+            debug!(stream_id = id, "reaped idle AOA proxy stream");
+        }
+    }
+}
+
+const ANDROID_VENDORS: &[u16] = &[
+    0x18d1, 0x17ef, 0x2717, 0x04e8, 0x12d1, 0x22b8, 0x22d9, 0x2d95, 0x1004, 0x0fce, 0x0b05, 0x0bb4,
+    0x19d2, 0x2a45, 0x2a70, 0x2833, 0x1949, 0x1f3a, 0x0e8d, 0x1782, 0x2207, 0x05c6, 0x2916, 0x1bbb,
+    0x10a9, 0x2006, 0x2b4c, 0x33f3, 0x2e04,
+];
+
+fn enforce_stream_limit(
+    map: &mut HashMap<u16, StreamEntry>,
+    incoming: u16,
+    max: usize,
+) -> Option<(u16, TcpStream)> {
+    if map.len() < max || map.contains_key(&incoming) {
+        return None;
+    }
+    let oldest = map.keys().copied().filter(|id| *id != incoming).min()?;
+    map.remove(&oldest).map(|(_, sock, _, _)| (oldest, sock))
+}
+
+const CONTROL_SEND_TIMEOUT: Duration = Duration::from_millis(500);
+
+const TRIED_DEVICE_RETENTION: Duration = Duration::from_secs(120);
+
+fn send_control(tx: &std::sync::mpsc::SyncSender<Vec<u8>>, frame: Vec<u8>) -> Result<(), ()> {
+    let deadline = std::time::Instant::now() + CONTROL_SEND_TIMEOUT;
+    loop {
+        match tx.try_send(frame.clone()) {
+            Ok(()) => return Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Err(()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                if std::time::Instant::now() >= deadline {
+                    warn!("AOA control frame dropped: priority lane stayed full");
+                    return Err(());
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+const IDR_DEBOUNCE: Duration = Duration::from_millis(1000);
+const STALL_IDR_LIMIT: u32 = 64;
+
+#[derive(Clone, Debug)]
+pub struct UsbDeviceInfo {
+    pub bus_num: u16,
+    pub dev_num: u16,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub sysfs_path: PathBuf,
+    pub dev_node: PathBuf,
+}
+
+pub fn scan_usb_devices() -> Vec<UsbDeviceInfo> {
+    let mut devices = Vec::new();
+    let sys_usb = Path::new("/sys/bus/usb/devices");
+    let entries = match std::fs::read_dir(sys_usb) {
+        Ok(e) => e,
+        Err(_) => return devices,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.contains(':') {
+            continue;
+        }
+
+        let vid_str = match std::fs::read_to_string(path.join("idVendor")) {
+            Ok(s) => s.trim().to_owned(),
+            Err(_) => continue,
+        };
+        let pid_str = match std::fs::read_to_string(path.join("idProduct")) {
+            Ok(s) => s.trim().to_owned(),
+            Err(_) => continue,
+        };
+        let bus_str = match std::fs::read_to_string(path.join("busnum")) {
+            Ok(s) => s.trim().to_owned(),
+            Err(_) => continue,
+        };
+        let dev_str = match std::fs::read_to_string(path.join("devnum")) {
+            Ok(s) => s.trim().to_owned(),
+            Err(_) => continue,
+        };
+
+        let vid = match u16::from_str_radix(&vid_str, 16) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let pid = match u16::from_str_radix(&pid_str, 16) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let bus = match bus_str.parse::<u16>() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let dev = match dev_str.parse::<u16>() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let dev_node = PathBuf::from(format!("/dev/bus/usb/{bus:03}/{dev:03}"));
+        devices.push(UsbDeviceInfo {
+            bus_num: bus,
+            dev_num: dev,
+            vendor_id: vid,
+            product_id: pid,
+            sysfs_path: path,
+            dev_node,
+        });
+    }
+
+    devices
+}
+
+pub fn is_google_accessory(vid: u16, pid: u16) -> bool {
+    vid == 0x18d1 && matches!(pid, 0x2d00 | 0x2d01 | 0x2d04 | 0x2d05)
+}
+
+pub fn is_android_candidate(dev: &UsbDeviceInfo) -> bool {
+    if is_google_accessory(dev.vendor_id, dev.product_id) {
+        return false;
+    }
+    if ANDROID_VENDORS.contains(&dev.vendor_id) {
+        return true;
+    }
+    let prod = std::fs::read_to_string(dev.sysfs_path.join("product"))
+        .unwrap_or_default()
+        .to_lowercase();
+    let mfg = std::fs::read_to_string(dev.sysfs_path.join("manufacturer"))
+        .unwrap_or_default()
+        .to_lowercase();
+    if prod.contains("android")
+        || prod.contains("phone")
+        || prod.contains("tablet")
+        || prod.contains("pad")
+        || prod.contains("tab")
+        || mfg.contains("android")
+    {
+        return true;
+    }
+    if let Ok(entries) = std::fs::read_dir(&dev.sysfs_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if path.is_dir() && name_str.contains(':') {
+                if let Ok(iface_name) = std::fs::read_to_string(path.join("interface")) {
+                    let iface_lower = iface_name.to_lowercase();
+                    if iface_lower.contains("mtp") || iface_lower.contains("adb") {
+                        return true;
+                    }
+                }
+                let cls = std::fs::read_to_string(path.join("bInterfaceClass"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_lowercase();
+                let subcls = std::fs::read_to_string(path.join("bInterfaceSubClass"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_lowercase();
+                if cls == "06" || (cls == "ff" && subcls == "42") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[allow(unsafe_code)]
+fn ctrl_transfer(
+    fd: i32,
+    req_type: u8,
+    req: u8,
+    value: u16,
+    index: u16,
+    buf: &mut [u8],
+    timeout_ms: u32,
+) -> i32 {
+    let mut ctrl = UsbDevFsCtrlTransfer {
+        request_type: req_type,
+        request: req,
+        value,
+        index,
+        length: u16::try_from(buf.len()).unwrap_or(u16::MAX),
+        timeout: timeout_ms,
+        data: buf.as_mut_ptr(),
+    };
+    unsafe { ioctl(fd, USBDEVFS_CONTROL, &mut ctrl) }
+}
+
+pub fn probe_aoa_protocol(fd: i32) -> Option<u16> {
+    let mut buf = [0u8; 2];
+    let res = ctrl_transfer(fd, 0xC0, AOA_GET_PROTOCOL, 0, 0, &mut buf, 500);
+    if res == 2 {
+        let version = (buf[0] as u16) | ((buf[1] as u16) << 8);
+        if version >= 1 {
+            return Some(version);
+        }
+    }
+    None
+}
+
+pub fn send_aoa_string(fd: i32, index: u16, s: &str) -> bool {
+    let mut bytes = s.as_bytes().to_vec();
+    bytes.push(0);
+    let res = ctrl_transfer(fd, 0x40, AOA_SEND_STRING, 0, index, &mut bytes, 500);
+    res >= 0
+}
+
+pub fn start_aoa(fd: i32) -> bool {
+    let mut dummy = [0u8; 0];
+    let res = ctrl_transfer(fd, 0x40, AOA_START_ACCESSORY, 0, 0, &mut dummy, 500);
+    res >= 0
+}
+
+pub fn initiate_aoa_handshake(device: &UsbDeviceInfo) -> bool {
+    let f = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&device.dev_node)
+    {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let fd = f.as_raw_fd();
+
+    let version = match probe_aoa_protocol(fd) {
+        Some(v) => v,
+        None => return false,
+    };
+    info!(
+        "Detected AOA capable Android device {:04x}:{:04x} (AOA v{}) at {:?}",
+        device.vendor_id, device.product_id, version, device.dev_node
+    );
+
+    let serial = std::fs::read_to_string(device.sysfs_path.join("serial"))
+        .unwrap_or_else(|_| "orbiscreen".into())
+        .trim()
+        .to_owned();
+
+    send_aoa_string(fd, 0, "shadow-x78");
+    send_aoa_string(fd, 1, "Orbiscreen");
+    send_aoa_string(fd, 2, "Orbiscreen Display Server");
+    send_aoa_string(fd, 3, env!("CARGO_PKG_VERSION"));
+    send_aoa_string(fd, 4, "https://github.com/shadow-x78/orbiscreen");
+    send_aoa_string(fd, 5, &serial);
+
+    info!(
+        "Triggering AOA switch to accessory mode on {:?}",
+        device.dev_node
+    );
+    start_aoa(fd)
+}
+
+fn detect_endpoints(sysfs_path: &Path) -> (u32, u32) {
+    let mut in_ep = 0x81;
+    let mut out_ep = 0x02;
+
+    if let Ok(entries) = std::fs::read_dir(sysfs_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if path.is_dir() && name_str.contains(':') {
+                let is_iface_0 =
+                    if let Ok(num) = std::fs::read_to_string(path.join("bInterfaceNumber")) {
+                        num.trim() == "0" || num.trim() == "00"
+                    } else {
+                        name_str.ends_with(".0")
+                    };
+                if !is_iface_0 {
+                    continue;
+                }
+
+                if let Ok(ep_entries) = std::fs::read_dir(&path) {
+                    for ep_entry in ep_entries.flatten() {
+                        let ep_name = ep_entry.file_name();
+                        let ep_name_str = ep_name.to_string_lossy();
+                        if let Some(hex_str) = ep_name_str.strip_prefix("ep_") {
+                            if let Ok(ep_val) = u32::from_str_radix(hex_str, 16) {
+                                if ep_val >= 0x80 {
+                                    in_ep = ep_val;
+                                } else if ep_val > 0 {
+                                    out_ep = ep_val;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (in_ep, out_ep)
+}
+
+#[allow(unsafe_code)]
+fn bulk_write_slice(fd: i32, ep: u32, data: &[u8], running: &AtomicBool) -> bool {
+    let mut offset = 0;
+    let mut transient_retries = 0_u32;
+    while offset < data.len() && running.load(Ordering::Relaxed) {
+        let to_write = std::cmp::min(data.len() - offset, MAX_PAYLOAD_LEN);
+        let mut bulk = UsbDevFsBulkTransfer {
+            ep,
+            len: to_write as u32,
+            timeout: 250,
+            _pad: 0,
+            data: data[offset..].as_ptr() as *mut u8,
+        };
+        let written = unsafe { ioctl(fd, USBDEVFS_BULK, &mut bulk) };
+        if written < 0 {
+            let err = std::io::Error::last_os_error();
+            debug!("USB bulk write error: {err}");
+            if matches!(
+                err.raw_os_error(),
+                Some(110) | Some(libc::EINTR) | Some(libc::EAGAIN)
+            ) {
+                transient_retries = transient_retries.saturating_add(1);
+                if transient_retries > USB_TRANSIENT_RETRIES {
+                    debug!(
+                        retries = transient_retries,
+                        "USB bulk write gave up; the device is not draining the endpoint"
+                    );
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            return false;
+        }
+        offset += written as usize;
+        transient_retries = 0;
+    }
+    true
+}
+
+fn write_aoa_chunk(fd: i32, ep: u32, chunk: &[u8], running: &AtomicBool) -> bool {
+    let mut offset = 0;
+    while offset < chunk.len() && running.load(Ordering::Relaxed) {
+        match parse_aoa_frame(&chunk[offset..]) {
+            Some((_, used)) => {
+                if !bulk_write_slice(fd, ep, &chunk[offset..offset + used], running) {
+                    return false;
+                }
+                offset += used;
+            }
+            None => {
+                return bulk_write_slice(fd, ep, &chunk[offset..], running);
+            }
+        }
+    }
+    true
+}
+
+fn idr_due(last: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last) >= IDR_DEBOUNCE
+}
+
+fn prio_slot_free(prio_rx: &Mutex<std::sync::mpsc::Receiver<Vec<u8>>>) -> bool {
+    let rx = prio_rx.lock().unwrap_or_else(|p| p.into_inner());
+    rx.try_recv().is_ok()
+}
+
+fn au_slot_free(au_rx: &Mutex<std::sync::mpsc::Receiver<Vec<u8>>>) -> bool {
+    let rx = au_rx.lock().unwrap_or_else(|p| p.into_inner());
+    rx.try_recv().is_ok()
+}
+
+fn admit_fresh_au(
+    au_tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    au_rx: &Mutex<std::sync::mpsc::Receiver<Vec<u8>>>,
+    fresh: Vec<u8>,
+) -> (bool, bool) {
+    let mut fresh = fresh;
+    let mut evicted_stale = false;
+    for _ in 0..2 {
+        match au_tx.try_send(fresh) {
+            Ok(()) => return (true, evicted_stale),
+            Err(std::sync::mpsc::TrySendError::Full(frame)) => {
+                fresh = frame;
+                if au_slot_free(au_rx) {
+                    evicted_stale = true;
+                }
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return (false, evicted_stale);
+            }
+        }
+    }
+    (false, evicted_stale)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_native_video(
+    displays: DisplayCtl,
+    session: Option<String>,
+    prio_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    prio_rx: Arc<Mutex<std::sync::mpsc::Receiver<Vec<u8>>>>,
+    au_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    au_rx: Arc<Mutex<std::sync::mpsc::Receiver<Vec<u8>>>>,
+    running: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    struct DetachGuard(DisplayCtl, Vec<String>);
+    impl Drop for DetachGuard {
+        fn drop(&mut self) {
+            let ctl = self.0.clone();
+            let ids = std::mem::take(&mut self.1);
+            tokio::spawn(async move {
+                for id in ids {
+                    debug!("AOA native video releasing viewer session={id}");
+                    ctl.detach(&id).await;
+                }
+            });
+        }
+    }
+
+    let mut guard = DetachGuard(displays.clone(), Vec::new());
+
+    let attached = match displays.attach(session.clone(), None).await {
+        Ok(a) => a,
+        Err(e) => {
+            warn!("AOA native video attach failed: {e}");
+            let _ = send_control(&prio_tx, encode_video_close());
+            return;
+        }
+    };
+    let mut sid = attached.info.id.clone();
+    let mut video_rx = attached.video;
+    guard.1.push(sid.clone());
+    let _ = send_control(&prio_tx, encode_video_open_ack(crate::session::now_ns()));
+    displays.idr(&sid).await;
+    info!("AOA native Annex-B video attached session={sid}");
+
+    let mut wait_key = true;
+    let mut cached = None;
+    let mut dropped_keyframes: u32 = 0;
+    let mut dropped_stale_aus: u32 = 0;
+    let mut dropped_fresh_aus: u32 = 0;
+    let mut consecutive_evictions: u32 = 0;
+    let mut last_idr = Instant::now()
+        .checked_sub(IDR_DEBOUNCE)
+        .unwrap_or_else(Instant::now);
+
+    loop {
+        if stop.load(Ordering::Relaxed) || !running.load(Ordering::Relaxed) {
+            info!("AOA native video stopping session={sid}");
+            break;
+        }
+        let pkt = tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                continue;
+            }
+            res = video_rx.recv() => match res {
+                Ok(p) => p,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    debug!("AOA native video lagged {n}; wait for keyframe");
+                    wait_key = true;
+                    let now = Instant::now();
+                    if idr_due(last_idr, now) {
+                        last_idr = now;
+                        displays.idr(&sid).await;
+                    }
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    if stop.load(Ordering::Relaxed) || !running.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    info!("AOA video broadcast closed session={sid}; re-attaching");
+                    let mut attempt = Some(sid.clone());
+                    let mut reattached = false;
+                    for try_idx in 0..2 {
+                        if try_idx > 0 {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        let att = match attempt.clone() {
+                            Some(id) => displays.attach(Some(id), None).await,
+                            None => displays.attach(None, None).await,
+                        };
+                        match att {
+                            Ok(a) => {
+                                let new_sid = a.info.id.clone();
+                                if !guard.1.contains(&new_sid) {
+                                    guard.1.push(new_sid.clone());
+                                }
+                                sid = new_sid;
+                                video_rx = a.video;
+                                wait_key = true;
+                                last_idr = Instant::now();
+                                let _ = send_control(&prio_tx, encode_video_open_ack(crate::session::now_ns()));
+                                displays.idr(&sid).await;
+                                info!("AOA native video re-attached session={sid}");
+                                reattached = true;
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("AOA video re-attach failed: {e}");
+                                attempt = None;
+                            }
+                        }
+                    }
+                    if !reattached {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    continue;
+                }
+            },
+        };
+        if stop.load(Ordering::Relaxed) || !running.load(Ordering::Relaxed) {
+            break;
+        }
+        if wait_key {
+            if !pkt.is_keyframe {
+                let now = Instant::now();
+                if idr_due(last_idr, now) {
+                    last_idr = now;
+                    displays.idr(&sid).await;
+                }
+                continue;
+            }
+            wait_key = false;
+        }
+        let Some(packed) = pack_h264_packet(&pkt, crate::session::now_ns(), &mut cached) else {
+            continue;
+        };
+        match lane_for(pkt.is_keyframe) {
+            Lane::Priority => match prio_tx.try_send(packed) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(fresh)) => {
+                    let resent = prio_slot_free(&prio_rx) && prio_tx.try_send(fresh).is_ok();
+                    if !resent {
+                        dropped_keyframes = dropped_keyframes.saturating_add(1);
+                        if dropped_keyframes % 16 == 1 {
+                            warn!(
+                                session = %sid,
+                                dropped_keyframes,
+                                "AOA keyframe queue full; dropping the frame"
+                            );
+                        }
+                        wait_key = true;
+                        let now = Instant::now();
+                        if idr_due(last_idr, now) {
+                            last_idr = now;
+                            displays.idr(&sid).await;
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    if aoa_video::video_pump_should_release(aoa_video::VideoPumpEvent::SendFailed) {
+                        break;
+                    }
+                    warn!(
+                        "AOA video priority queue closed session={sid}; keeping the viewer lease"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+            Lane::Video => {
+                let (admitted, evicted_stale) = match au_tx.try_send(packed) {
+                    Ok(()) => (true, false),
+                    Err(std::sync::mpsc::TrySendError::Full(fresh)) => {
+                        admit_fresh_au(&au_tx, &au_rx, fresh)
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => (false, false),
+                };
+                if evicted_stale {
+                    dropped_stale_aus = dropped_stale_aus.saturating_add(1);
+                    consecutive_evictions = consecutive_evictions.saturating_add(1);
+                    if dropped_stale_aus % 16 == 1 {
+                        warn!(
+                            session = %sid,
+                            dropped_stale_aus,
+                            consecutive_evictions,
+                            "AOA video lane full; discarded the oldest queued frame"
+                        );
+                    }
+                    wait_key = true;
+                    if consecutive_evictions <= STALL_IDR_LIMIT {
+                        let now = Instant::now();
+                        if idr_due(last_idr, now) {
+                            last_idr = now;
+                            displays.idr(&sid).await;
+                        }
+                    }
+                }
+                if admitted {
+                    consecutive_evictions = 0;
+                }
+                if !admitted {
+                    dropped_fresh_aus = dropped_fresh_aus.saturating_add(1);
+                    if dropped_fresh_aus % 16 == 1 {
+                        warn!(
+                            session = %sid,
+                            dropped_fresh_aus,
+                            key = pkt.is_keyframe,
+                            "AOA video lane full or closed; dropped the fresh frame"
+                        );
+                    }
+                    if pkt.is_keyframe {
+                        wait_key = true;
+                        let now = Instant::now();
+                        if idr_due(last_idr, now) {
+                            last_idr = now;
+                            displays.idr(&sid).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_video_request(payload: &[u8]) -> bool {
+    payload.starts_with(b"GET /au") || payload.windows(7).any(|w| w == b"/stream")
+}
+
+const PROXY_CONNECT_RETRIES: u32 = 10;
+const PROXY_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(150);
+
+fn send_proxy_close(stream_id: u16, prio_tx: &std::sync::mpsc::SyncSender<Vec<u8>>) {
+    let mut close_frame = Vec::with_capacity(FRAME_HEADER_LEN);
+    close_frame.extend_from_slice(&stream_id.to_be_bytes());
+    close_frame.push(FRAME_FLAG_CLOSE);
+    close_frame.extend_from_slice(&0u16.to_be_bytes());
+    let _ = prio_tx.try_send(close_frame);
+}
+
+fn open_proxy_stream(
+    daemon_port: u16,
+    stream_id: u16,
+    tcp_streams: &StreamMap,
+    prio_tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    video_tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    running: &Arc<AtomicBool>,
+) {
+    let addr = format!("127.0.0.1:{daemon_port}");
+    match TcpStream::connect(&addr) {
+        Ok(stream) => {
+            finish_proxy_stream(stream, stream_id, tcp_streams, prio_tx, video_tx, running)
+        }
+        Err(e) if daemon_port != 8788 => {
+            debug!("AOA proxy connect to {addr} failed: {e}; retrying in the background");
+            let tcp_streams = tcp_streams.clone();
+            let prio_tx = prio_tx.clone();
+            let video_tx = video_tx.clone();
+            let running = running.clone();
+            std::thread::spawn(move || {
+                for _ in 0..PROXY_CONNECT_RETRIES {
+                    if !running.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(PROXY_CONNECT_RETRY_DELAY);
+                    match TcpStream::connect(&addr) {
+                        Ok(stream) => {
+                            finish_proxy_stream(
+                                stream,
+                                stream_id,
+                                &tcp_streams,
+                                &prio_tx,
+                                &video_tx,
+                                &running,
+                            );
+                            return;
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                send_proxy_close(stream_id, &prio_tx);
+            });
+        }
+        Err(e) => {
+            debug!("Failed to connect to local daemon at {addr}: {e}");
+            send_proxy_close(stream_id, prio_tx);
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+fn finish_proxy_stream(
+    mut tcp_stream: TcpStream,
+    stream_id: u16,
+    tcp_streams: &StreamMap,
+    prio_tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    video_tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    running: &Arc<AtomicBool>,
+) {
+    let _ = tcp_stream.set_nodelay(true);
+    let _ = tcp_stream.set_read_timeout(Some(Duration::from_millis(1500)));
+    let raw_sock_fd = tcp_stream.as_raw_fd();
+    let sock_buf_size: libc::c_int = 32768;
+    unsafe {
+        libc::setsockopt(
+            raw_sock_fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &sock_buf_size as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&sock_buf_size) as libc::socklen_t,
+        );
+        libc::setsockopt(
+            raw_sock_fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &sock_buf_size as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&sock_buf_size) as libc::socklen_t,
+        );
+    }
+    let (tcp_tx, tcp_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+    let is_video = Arc::new(AtomicBool::new(false));
+    let activity = Arc::new(AtomicU64::new(now_ms()));
+    let Ok(stream_for_map) = tcp_stream.try_clone() else {
+        let _ = tcp_stream.shutdown(std::net::Shutdown::Both);
+        return;
+    };
+    {
+        let mut map = tcp_streams.lock().unwrap_or_else(|p| p.into_inner());
+        reap_idle_streams(&mut map, prio_tx);
+        if let Some((evicted_stream_id, evicted)) =
+            enforce_stream_limit(&mut map, stream_id, MAX_AOA_STREAMS)
+        {
+            let _ = evicted.shutdown(std::net::Shutdown::Both);
+            send_proxy_close(evicted_stream_id, prio_tx);
+            let suppressed = EVICTION_REPORTS.fetch_add(1, Ordering::Relaxed);
+            let now = now_ms();
+            let last = LAST_EVICTION_REPORT_MS.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= EVICTION_REPORT_INTERVAL.as_millis() as u64 {
+                LAST_EVICTION_REPORT_MS.store(now, Ordering::Relaxed);
+                EVICTION_REPORTS.store(0, Ordering::Relaxed);
+                warn!(
+                    evicted_stream_id,
+                    stream_id,
+                    open_streams = map.len(),
+                    max_streams = MAX_AOA_STREAMS,
+                    suppressed,
+                    "AOA stream limit reached; evicted the oldest stream"
+                );
+            } else {
+                debug!(
+                    evicted_stream_id,
+                    stream_id, "AOA stream limit reached; evicted the oldest stream"
+                );
+            }
+        }
+        map.insert(
+            stream_id,
+            (tcp_tx, stream_for_map, is_video.clone(), activity.clone()),
+        );
+    }
+
+    let prio_tx_clone = prio_tx.clone();
+    let video_tx_clone = video_tx.clone();
+    let running_tcp = running.clone();
+    let tcp_streams_reader = tcp_streams.clone();
+    let activity_reader = activity.clone();
+    let mut tcp_read_stream = match tcp_stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => {
+            let mut map = tcp_streams_reader.lock().unwrap_or_else(|p| p.into_inner());
+            map.remove(&stream_id);
+            return;
+        }
+    };
+
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; MAX_PAYLOAD_LEN - FRAME_HEADER_LEN];
+        while running_tcp.load(Ordering::Relaxed) {
+            match tcp_read_stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    touch(&activity_reader);
+                    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + n);
+                    frame.extend_from_slice(&stream_id.to_be_bytes());
+                    frame.push(FRAME_FLAG_DATA);
+                    frame.extend_from_slice(&(n as u16).to_be_bytes());
+                    frame.extend_from_slice(&buf[..n]);
+                    if is_video.load(Ordering::Relaxed) {
+                        if video_tx_clone.send(frame).is_err() {
+                            break;
+                        }
+                    } else if prio_tx_clone
+                        .try_send(frame)
+                        .is_err_and(|e| matches!(e, std::sync::mpsc::TrySendError::Disconnected(_)))
+                    {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => break,
+            }
+        }
+        let mut close_frame = Vec::with_capacity(FRAME_HEADER_LEN);
+        close_frame.extend_from_slice(&stream_id.to_be_bytes());
+        close_frame.push(FRAME_FLAG_CLOSE);
+        close_frame.extend_from_slice(&0u16.to_be_bytes());
+        let _ = prio_tx_clone.try_send(close_frame);
+        let mut map = tcp_streams_reader.lock().unwrap_or_else(|p| p.into_inner());
+        map.remove(&stream_id);
+    });
+
+    let running_writer = running.clone();
+    let activity_writer = activity.clone();
+    std::thread::spawn(move || {
+        while running_writer.load(Ordering::Relaxed) {
+            match tcp_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(bytes) => {
+                    if tcp_stream.write_all(&bytes).is_err() {
+                        break;
+                    }
+                    touch(&activity_writer);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+}
+
+#[allow(unsafe_code)]
+pub fn run_accessory_bridge(
+    device: &UsbDeviceInfo,
+    daemon_port: u16,
+    running: Arc<AtomicBool>,
+    displays: Option<DisplayCtl>,
+) -> Result<(), String> {
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&device.dev_node)
+        .map_err(|e| {
+            format!(
+                "Failed to open accessory dev node {:?}: {e}",
+                device.dev_node
+            )
+        })?;
+    let fd = f.as_raw_fd();
+
+    let iface = 0u32;
+    let mut claimed = false;
+    let mut last_err = std::io::Error::last_os_error();
+
+    for attempt in 0..3 {
+        let mut dc = UsbDevFsDisconnectClaim {
+            interface: iface,
+            flags: 0,
+            driver: [0u8; 256],
+        };
+        let mut res = unsafe { ioctl(fd, USBDEVFS_DISCONNECT_CLAIM, &mut dc) };
+        if res < 0 {
+            res = unsafe { ioctl(fd, USBDEVFS_CLAIMINTERFACE, &iface) };
+        }
+        if res >= 0 {
+            claimed = true;
+            break;
+        }
+        last_err = std::io::Error::last_os_error();
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    if !claimed {
+        return Err(format!("Failed to claim interface 0: {}", last_err));
+    }
+
+    let (in_ep, out_ep) = detect_endpoints(&device.sysfs_path);
+    let link_mbps = std::fs::read_to_string(device.sysfs_path.join("speed"))
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_else(|_| "unknown".to_owned());
+    info!(
+        link_mbps = %link_mbps,
+        "AOA accessory claimed on {:?}, in_ep=0x{:02x}, out_ep=0x{:02x}",
+        device.dev_node, in_ep, out_ep
+    );
+
+    let (prio_tx, prio_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PRIO_QUEUE_CAP);
+    let prio_rx = Arc::new(Mutex::new(prio_rx));
+    let (video_tx, video_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+    let (au_tx, au_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(VIDEO_QUEUE_CAP);
+    let au_rx = Arc::new(Mutex::new(au_rx));
+    let prio_rx_writer = prio_rx.clone();
+    let au_rx_writer = au_rx.clone();
+    let mut consecutive_write_failures: u32 = 0;
+    let running_writer = running.clone();
+    let fd_writer = fd;
+    let writer_handle = std::thread::spawn(move || {
+        while running_writer.load(Ordering::Relaxed) {
+            let prio_rx = prio_rx_writer.lock().unwrap_or_else(|p| p.into_inner());
+            let chunk = match prio_rx.try_recv() {
+                Ok(c) => c,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    let au_chunk = {
+                        let au_rx = au_rx_writer.lock().unwrap_or_else(|p| p.into_inner());
+                        au_rx.recv_timeout(Duration::from_millis(5))
+                    };
+                    match au_chunk {
+                        Ok(c) => c,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            match video_rx.try_recv() {
+                                Ok(c) => c,
+                                Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            match video_rx.recv_timeout(Duration::from_millis(50)) {
+                                Ok(c) => c,
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            };
+            drop(prio_rx);
+
+            if !write_aoa_chunk(fd_writer, out_ep, &chunk, &running_writer) {
+                consecutive_write_failures = consecutive_write_failures.saturating_add(1);
+                if consecutive_write_failures == 1 {
+                    warn!("AOA writer could not send a packet; retrying until the lane drains");
+                }
+                if consecutive_write_failures >= WRITE_FAILURE_LIMIT {
+                    warn!(
+                        failures = consecutive_write_failures,
+                        "AOA writer giving up; the device stopped draining the endpoint"
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            consecutive_write_failures = 0;
+        }
+    });
+
+    let tcp_streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+    let mut rx_buf = vec![0u8; MAX_PAYLOAD_LEN + FRAME_HEADER_LEN];
+    let mut acc_buf = Vec::new();
+    let mut native_stop = Arc::new(AtomicBool::new(false));
+    let mut native_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+    let mut consecutive_proto_errs: u32 = 0;
+    while running.load(Ordering::Relaxed) {
+        let mut bulk = UsbDevFsBulkTransfer {
+            ep: in_ep,
+            len: rx_buf.len() as u32,
+            timeout: 500,
+            _pad: 0,
+            data: rx_buf.as_mut_ptr(),
+        };
+        let read_bytes = unsafe { ioctl(fd, USBDEVFS_BULK, &mut bulk) };
+        if read_bytes < 0 {
+            let err = std::io::Error::last_os_error();
+            let raw_err = err.raw_os_error();
+            if raw_err == Some(110) || raw_err == Some(libc::EINTR) {
+                consecutive_proto_errs = 0;
+                continue;
+            }
+            if raw_err == Some(libc::EPROTO) {
+                consecutive_proto_errs += 1;
+                if consecutive_proto_errs >= 50 {
+                    warn!(
+                        "USB bulk read: too many consecutive protocol errors; releasing accessory"
+                    );
+                    break;
+                }
+                let sleep_ms = (10 * consecutive_proto_errs).min(200) as u64;
+                std::thread::sleep(Duration::from_millis(sleep_ms));
+                continue;
+            }
+            match err.raw_os_error() {
+                Some(libc::ENODEV) | Some(libc::ESHUTDOWN) => {
+                    info!("accessory disconnected; releasing the AOA bridge");
+                }
+                _ => warn!("USB bulk read error on accessory: {err}"),
+            }
+            break;
+        }
+        consecutive_proto_errs = 0;
+
+        if read_bytes > 0 {
+            acc_buf.extend_from_slice(&rx_buf[..read_bytes as usize]);
+
+            while acc_buf.len() >= FRAME_HEADER_LEN {
+                let stream_id = u16::from_be_bytes([acc_buf[0], acc_buf[1]]);
+                let flags = acc_buf[2];
+                let payload_len = u16::from_be_bytes([acc_buf[3], acc_buf[4]]) as usize;
+                let total_frame_len = FRAME_HEADER_LEN + payload_len;
+
+                if acc_buf.len() < total_frame_len {
+                    break;
+                }
+
+                let payload = acc_buf[FRAME_HEADER_LEN..total_frame_len].to_vec();
+                acc_buf.drain(..total_frame_len);
+
+                if (flags & FRAME_FLAG_VIDEO) != 0 {
+                    if (flags & FRAME_FLAG_OPEN) != 0 {
+                        native_stop.store(true, Ordering::Relaxed);
+                        if let Some(h) = native_handle.take() {
+                            h.abort();
+                        }
+                        let session = aoa_video::decode_video_open_session(&payload)
+                            .filter(|s| !s.is_empty());
+                        match displays.clone() {
+                            Some(ctl) => {
+                                native_stop = Arc::new(AtomicBool::new(false));
+                                let stop = native_stop.clone();
+                                let running_v = running.clone();
+                                let prio_v = prio_tx.clone();
+                                let prio_rx_v = prio_rx.clone();
+                                let au_v = au_tx.clone();
+                                let au_rx_v = au_rx.clone();
+                                native_handle =
+                                    Some(tokio::runtime::Handle::current().spawn(async move {
+                                        run_native_video(
+                                            ctl, session, prio_v, prio_rx_v, au_v, au_rx_v,
+                                            running_v, stop,
+                                        )
+                                        .await;
+                                    }));
+                            }
+                            None => {
+                                let _ = send_control(&prio_tx, encode_video_close());
+                            }
+                        }
+                    } else if (flags & FRAME_FLAG_CLOSE) != 0 {
+                        native_stop.store(true, Ordering::Relaxed);
+                        if let Some(h) = native_handle.take() {
+                            h.abort();
+                        }
+                    }
+                } else if (flags & FRAME_FLAG_OPEN) != 0 {
+                    open_proxy_stream(
+                        daemon_port,
+                        stream_id,
+                        &tcp_streams,
+                        &prio_tx,
+                        &video_tx,
+                        &running,
+                    );
+                } else if (flags & FRAME_FLAG_DATA) != 0 {
+                    let map = tcp_streams.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some((tx, _, is_video, activity)) = map.get(&stream_id) {
+                        touch(activity);
+                        if is_video_request(&payload) {
+                            is_video.store(true, Ordering::Relaxed);
+                        }
+                        if tx.try_send(payload).is_err() {
+                            debug!(stream_id, "AOA inbound stream queue full; chunk dropped");
+                        }
+                    }
+                } else if (flags & FRAME_FLAG_CLOSE) != 0 {
+                    let mut map = tcp_streams.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some((_, stream, _, _)) = map.remove(&stream_id) {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    }
+                }
+            }
+        }
+    }
+
+    native_stop.store(true, Ordering::Relaxed);
+    if let Some(h) = native_handle.take() {
+        h.abort();
+    }
+
+    let mut reset_frame = vec![0u8; FRAME_HEADER_LEN];
+    reset_frame[2] = FRAME_FLAG_RESET;
+    let _ = send_control(&prio_tx, reset_frame);
+    std::thread::sleep(Duration::from_millis(60));
+
+    running.store(false, Ordering::Relaxed);
+    {
+        let mut map = tcp_streams.lock().unwrap_or_else(|p| p.into_inner());
+        for (_, (_, stream, _, _)) in map.drain() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+    let _ = writer_handle.join();
+    unsafe { ioctl(fd, USBDEVFS_RELEASEINTERFACE, &iface) };
+    info!("AOA accessory released on {:?}", device.dev_node);
+    Ok(())
+}
+
+pub fn get_connected_candidate_names() -> Vec<String> {
+    let mut names = Vec::new();
+    let devices = scan_usb_devices();
+    for dev in &devices {
+        if dev.vendor_id == 0x1d6b {
+            continue;
+        }
+        let is_acc = is_google_accessory(dev.vendor_id, dev.product_id);
+        let is_cand = is_android_candidate(dev);
+        if !is_acc && !is_cand {
+            continue;
+        }
+        if is_acc {
+            names.push("Google Accessory".to_string());
+        } else {
+            let prod = std::fs::read_to_string(dev.sysfs_path.join("product"))
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let mfg = std::fs::read_to_string(dev.sysfs_path.join("manufacturer"))
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let name = if !mfg.is_empty() && !prod.is_empty() {
+                format!("{mfg} {prod}")
+            } else if !prod.is_empty() {
+                prod
+            } else {
+                format!("{:04x}:{:04x}", dev.vendor_id, dev.product_id)
+            };
+            names.push(name);
+        }
+    }
+    names
+}
+
+struct ActiveBridge {
+    running: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<Result<(), String>>,
+}
+
+pub async fn supervisor(
+    daemon_port: u16,
+    active_count: Arc<AtomicUsize>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    displays: Option<DisplayCtl>,
+) {
+    let mut tried_devices: HashMap<(u16, u16, u16, u16), std::time::Instant> = HashMap::new();
+    let mut active_bridges: HashMap<PathBuf, ActiveBridge> = HashMap::new();
+
+    loop {
+        let devices = scan_usb_devices();
+        let now = std::time::Instant::now();
+
+        active_bridges.retain(|dev_node, bridge| {
+            if bridge.handle.is_finished() {
+                debug!("AOA bridge on {:?} finished", dev_node);
+                false
+            } else {
+                true
+            }
+        });
+
+        for dev in &devices {
+            if is_google_accessory(dev.vendor_id, dev.product_id) {
+                if !active_bridges.contains_key(&dev.dev_node) {
+                    info!("AOA accessory device detected: {:?}", dev.dev_node);
+                    let target_port = daemon_port;
+                    let running = Arc::new(AtomicBool::new(true));
+                    let running_inner = running.clone();
+                    let dev_clone = dev.clone();
+                    let displays_bridge = displays.clone();
+                    let handle = tokio::task::spawn_blocking(move || {
+                        run_accessory_bridge(
+                            &dev_clone,
+                            target_port,
+                            running_inner,
+                            displays_bridge,
+                        )
+                    });
+                    active_bridges.insert(dev.dev_node.clone(), ActiveBridge { running, handle });
+                }
+            } else if dev.vendor_id != 0x1d6b && is_android_candidate(dev) {
+                let key = (dev.vendor_id, dev.product_id, dev.bus_num, dev.dev_num);
+                if let Some(last_time) = tried_devices.get(&key) {
+                    if now.duration_since(*last_time) < Duration::from_secs(4) {
+                        continue;
+                    }
+                }
+                tried_devices.insert(key, now);
+                tried_devices.retain(|_, t| now.duration_since(*t) < TRIED_DEVICE_RETENTION);
+                let dev_clone = dev.clone();
+                tokio::task::spawn_blocking(move || initiate_aoa_handshake(&dev_clone));
+            }
+        }
+
+        active_count.store(active_bridges.len(), Ordering::Relaxed);
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(1200)) => {}
+            _ = shutdown.changed() => break,
+        }
+    }
+
+    for (_, bridge) in active_bridges.drain() {
+        bridge.running.store(false, Ordering::Relaxed);
+    }
+    active_count.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_priority_queue_still_admits_the_new_keyframe() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PRIO_QUEUE_CAP);
+        let rx = Mutex::new(rx);
+        for i in 0..PRIO_QUEUE_CAP {
+            assert!(tx.try_send(vec![i as u8]).is_ok());
+        }
+        let Err(std::sync::mpsc::TrySendError::Full(fresh)) = tx.try_send(vec![0xfe]) else {
+            panic!("expected a full queue");
+        };
+        let resent = prio_slot_free(&rx) && tx.try_send(fresh).is_ok();
+        assert!(resent, "the new keyframe could not be admitted");
+
+        let keys: Vec<u8> = rx
+            .lock()
+            .unwrap()
+            .try_iter()
+            .map(|f: Vec<u8>| f[0])
+            .collect();
+        assert_eq!(keys.len(), PRIO_QUEUE_CAP, "the bound must still hold");
+        assert!(keys.contains(&0xfe), "the new keyframe was dropped");
+        assert!(
+            !keys.contains(&0x00),
+            "a stale keyframe still occupies the slot"
+        );
+    }
+
+    #[test]
+    fn an_empty_priority_queue_frees_nothing() {
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PRIO_QUEUE_CAP);
+        assert!(!prio_slot_free(&Mutex::new(rx)));
+    }
+
+    #[test]
+    fn the_udev_rules_cover_every_android_candidate_vendor() {
+        let rules_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/99-orbiscreen-usb.rules");
+        let rules = std::fs::read_to_string(&rules_path)
+            .unwrap_or_else(|e| panic!("could not read {}: {e}", rules_path.display()));
+        for vid in ANDROID_VENDORS {
+            let needle = format!("idVendor}}==\"{vid:04x}\"");
+            assert!(
+                rules.contains(&needle),
+                "udev rules are missing vendor {vid:04x}; sync data/99-orbiscreen-usb.rules"
+            );
+        }
+    }
+
+    #[test]
+    fn the_au_request_marks_a_proxy_stream_as_video() {
+        assert!(is_video_request(
+            b"GET /au?token=abc&session=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ));
+        assert!(is_video_request(
+            b"GET /au HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ));
+        assert!(is_video_request(
+            b"POST /api/x HTTP/1.1\r\n\r\npayload /stream marker"
+        ));
+        assert!(!is_video_request(
+            b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ));
+        assert!(!is_video_request(b"POST /api/session HTTP/1.1\r\n\r\n"));
+        assert!(!is_video_request(b""));
+    }
+
+    #[test]
+    fn a_proxy_stream_round_trips_data_and_reaps_on_close() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (prio_tx, prio_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+        let (video_tx, _video_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+        let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        let running = Arc::new(AtomicBool::new(true));
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 16];
+            let n = sock.read(&mut buf).expect("read");
+            assert_eq!(&buf[..n], b"ping");
+            sock.write_all(b"pong").expect("write");
+            drop(sock);
+        });
+
+        open_proxy_stream(port, 42, &streams, &prio_tx, &video_tx, &running);
+        {
+            let map = streams.lock().unwrap_or_else(|p| p.into_inner());
+            let (tx, _, is_video, _) = map.get(&42).expect("stream registered");
+            assert!(!is_video.load(Ordering::Relaxed));
+            let tx = tx.clone();
+            drop(map);
+            tx.send(b"ping".to_vec()).expect("queue");
+        }
+        server.join().expect("server");
+
+        let frame = prio_rx
+            .recv_timeout(Duration::from_millis(2000))
+            .expect("data frame");
+        let (parsed, _) = parse_aoa_frame(&frame).expect("parse");
+        assert_eq!(parsed.stream_id, 42);
+        assert_eq!(parsed.flags, FRAME_FLAG_DATA);
+        assert_eq!(parsed.payload, b"pong");
+
+        let close = prio_rx
+            .recv_timeout(Duration::from_millis(2000))
+            .expect("close frame");
+        let (parsed, _) = parse_aoa_frame(&close).expect("parse");
+        assert_eq!(parsed.stream_id, 42);
+        assert_eq!(parsed.flags, FRAME_FLAG_CLOSE);
+
+        let mut reaped = false;
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        while Instant::now() < deadline {
+            if streams.lock().unwrap_or_else(|p| p.into_inner()).is_empty() {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reaped, "the closed stream was never removed from the map");
+    }
+
+    #[test]
+    fn a_failed_proxy_open_sends_close_after_retries() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        if port == 8788 {
+            return;
+        }
+        let (prio_tx, prio_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+        let (video_tx, _video_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+        let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        let running = Arc::new(AtomicBool::new(true));
+
+        open_proxy_stream(port, 7, &streams, &prio_tx, &video_tx, &running);
+
+        let close = prio_rx
+            .recv_timeout(Duration::from_millis(4000))
+            .expect("close frame");
+        let (parsed, _) = parse_aoa_frame(&close).expect("parse");
+        assert_eq!(parsed.stream_id, 7);
+        assert_eq!(parsed.flags, FRAME_FLAG_CLOSE);
+        assert!(
+            streams.lock().unwrap_or_else(|p| p.into_inner()).is_empty(),
+            "no stream may be registered when every connect failed"
+        );
+    }
+
+    #[test]
+    fn a_full_video_lane_still_admits_the_fresh_au() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(VIDEO_QUEUE_CAP);
+        let rx = Mutex::new(rx);
+        for i in 0..VIDEO_QUEUE_CAP {
+            assert!(tx.try_send(vec![i as u8]).is_ok());
+        }
+        let Err(std::sync::mpsc::TrySendError::Full(fresh)) = tx.try_send(vec![0xfe]) else {
+            panic!("expected a full video lane");
+        };
+        let (admitted, evicted_stale) = admit_fresh_au(&tx, &rx, fresh);
+        assert!(admitted, "the fresh au could not be admitted");
+        assert!(evicted_stale, "no stale au was discarded");
+
+        let keys: Vec<u8> = rx
+            .lock()
+            .unwrap()
+            .try_iter()
+            .map(|f: Vec<u8>| f[0])
+            .collect();
+        assert_eq!(keys.len(), VIDEO_QUEUE_CAP, "the bound must still hold");
+        assert!(keys.contains(&0xfe), "the fresh au was dropped");
+        assert!(
+            !keys.contains(&0x00),
+            "the oldest au still occupies the slot"
+        );
+    }
+
+    #[test]
+    fn an_empty_video_lane_admits_without_evicting() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(VIDEO_QUEUE_CAP);
+        let rx = Mutex::new(rx);
+        let (admitted, evicted_stale) = admit_fresh_au(&tx, &rx, vec![0xfe]);
+        assert!(admitted);
+        assert!(!evicted_stale, "nothing was queued to evict");
+        assert_eq!(
+            rx.lock().unwrap().try_recv().expect("fresh")[0],
+            0xfe,
+            "the fresh au was not the one admitted"
+        );
+    }
+
+    #[test]
+    fn a_drained_video_lane_lets_the_fresh_au_through() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let rx = Mutex::new(rx);
+        assert!(tx.try_send(vec![0x01]).is_ok());
+        let Err(std::sync::mpsc::TrySendError::Full(_)) = tx.try_send(vec![0x02]) else {
+            panic!("expected a full lane");
+        };
+        let rx_drained = rx.lock().unwrap().try_recv().is_ok();
+        assert!(rx_drained);
+        let (admitted, evicted_stale) = admit_fresh_au(&tx, &rx, vec![0xfe]);
+        assert!(
+            admitted,
+            "the fresh au was dropped after a concurrent drain"
+        );
+        assert!(!evicted_stale, "the lane was already empty when probed");
+    }
+
+    fn fake_streams(ids: &[u16]) -> HashMap<u16, StreamEntry> {
+        let mut map = HashMap::new();
+        for &id in ids {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            std::thread::spawn(move || {
+                let _ = listener.accept();
+            });
+            let sock = std::net::TcpStream::connect(addr).expect("connect");
+            let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+            map.insert(
+                id,
+                (
+                    tx,
+                    sock,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicU64::new(now_ms())),
+                ),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn the_stream_bound_evicts_the_oldest_instead_of_refusing() {
+        let mut map = fake_streams(&[1, 2, 3]);
+        assert!(enforce_stream_limit(&mut map, 4, 4).is_none());
+        assert_eq!(map.len(), 3);
+
+        let evicted = enforce_stream_limit(&mut map, 4, 3).expect("evict");
+        assert_eq!(evicted.0, 1, "the lowest id is the oldest stream");
+        assert!(!map.contains_key(&1));
+        assert!(map.contains_key(&3), "stream 3 is retained");
+        assert_eq!(
+            map.len(),
+            2,
+            "one entry left after the caller inserts its own"
+        );
+    }
+
+    #[test]
+    fn re_opening_an_existing_stream_id_is_never_an_eviction() {
+        let mut map = fake_streams(&[1, 2, 3]);
+        assert!(enforce_stream_limit(&mut map, 2, 3).is_none());
+        assert_eq!(
+            map.len(),
+            3,
+            "a re-open of a live id must not drop anything"
+        );
+    }
+
+    #[test]
+    fn repeated_reconnects_never_exhaust_the_bound() {
+        let mut map = fake_streams(&[0]);
+        for id in 1..200u16 {
+            if let Some((evicted, sock)) = enforce_stream_limit(&mut map, id, MAX_AOA_STREAMS) {
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+                assert!(evicted < id, "the oldest id is always the one dropped");
+            }
+            map.insert(id, fake_entry());
+            assert!(
+                map.len() <= MAX_AOA_STREAMS,
+                "the bound grew to {} entries",
+                map.len()
+            );
+        }
+    }
+
+    fn fake_entry() -> StreamEntry {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        let sock = std::net::TcpStream::connect(addr).expect("connect");
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        (
+            tx,
+            sock,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(now_ms())),
+        )
+    }
+
+    #[test]
+    fn idle_proxy_streams_are_reaped_before_the_limit_is_hit() {
+        let mut map = fake_streams(&[1, 2]);
+        let stale = now_ms().saturating_sub(STREAM_IDLE_TIMEOUT.as_millis() as u64 + 1_000);
+        if let Some((_, _, _, activity)) = map.get_mut(&1) {
+            activity.store(stale, Ordering::Relaxed);
+        }
+        let (prio_tx, _prio_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PRIO_QUEUE_CAP);
+        reap_idle_streams(&mut map, &prio_tx);
+        assert!(!map.contains_key(&1), "the idle stream should be gone");
+        assert!(map.contains_key(&2), "the active stream must survive");
+    }
+
+    #[test]
+    fn the_priority_lane_is_bounded() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PRIO_QUEUE_CAP);
+        for i in 0..PRIO_QUEUE_CAP {
+            assert!(tx.try_send(vec![i as u8]).is_ok());
+        }
+        assert!(matches!(
+            tx.try_send(vec![0xff]),
+            Err(std::sync::mpsc::TrySendError::Full(_))
+        ));
+        assert_eq!(rx.try_recv().expect("first").len(), 1);
+        assert!(tx.try_send(vec![0xee]).is_ok());
+    }
+}
